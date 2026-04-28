@@ -10,12 +10,19 @@ from scipy.stats import norm
 from math import comb
 from scipy.interpolate import interp1d
 from scipy.optimize import minimize_scalar
-
+import time
+from contextlib import contextmanager
 # 0. Rouwenhorst method for approximating AR(1) processes ----------------
 
 # %%
+@contextmanager
+def timer(name):
+    start = time.perf_counter()
+    yield
+    end = time.perf_counter()
+    print(f"{name}: {end - start:.4f} sec")
 
-
+#%% 
 class Rouwenhorst:
     def __init__(self, n, rho, sigma_eps, seed=None):
         """
@@ -103,7 +110,107 @@ class Rouwenhorst:
             z[t] = self.rho * z[t - 1] + self.sigma_eps * eps
 
         return z
+    
 
+class Tauchen:
+    def __init__(self, n, rho, sigma_eps, m=3.0, seed=None):
+        """
+        Tauchen approximation to:
+
+            x_{t+1} = rho x_t + sigma_eps eps_{t+1}
+            eps ~ N(0,1)
+
+        Parameters
+        ----------
+        n : int
+            Number of grid points.
+        rho : float
+            Persistence.
+        sigma_eps : float
+            Innovation standard deviation.
+        m : float
+            Width of grid in unconditional standard deviations.
+            Usually 2.5 or 3.0.
+        seed : int or None
+            Random seed.
+        """
+
+        self.n = n
+        self.rho = rho
+        self.sigma_eps = sigma_eps
+        self.m = m
+        self.rng = np.random.default_rng(seed)
+
+        self.sigma_x = sigma_eps / np.sqrt(1 - rho**2)
+
+        self.grid = self._build_grid()
+        self.P = self._build_transition()
+        self.stationary_dist = self._stationary_distribution()
+
+    def _build_grid(self):
+        x_min = -self.m * self.sigma_x
+        x_max = self.m * self.sigma_x
+        return np.linspace(x_min, x_max, self.n)
+
+    def _build_transition(self):
+        P = np.zeros((self.n, self.n))
+        step = self.grid[1] - self.grid[0]
+
+        for i, x in enumerate(self.grid):
+            mean_next = self.rho * x
+
+            for j, x_next in enumerate(self.grid):
+                if j == 0:
+                    upper = (x_next + step / 2 - mean_next) / self.sigma_eps
+                    P[i, j] = norm.cdf(upper)
+
+                elif j == self.n - 1:
+                    lower = (x_next - step / 2 - mean_next) / self.sigma_eps
+                    P[i, j] = 1 - norm.cdf(lower)
+
+                else:
+                    upper = (x_next + step / 2 - mean_next) / self.sigma_eps
+                    lower = (x_next - step / 2 - mean_next) / self.sigma_eps
+                    P[i, j] = norm.cdf(upper) - norm.cdf(lower)
+
+        return P
+
+    def _stationary_distribution(self):
+        eigvals, eigvecs = np.linalg.eig(self.P.T)
+        idx = np.argmin(np.abs(eigvals - 1.0))
+
+        pi = np.real(eigvecs[:, idx])
+        pi = pi / pi.sum()
+
+        # avoid tiny negative numerical noise
+        pi = np.maximum(pi, 0)
+        pi = pi / pi.sum()
+
+        return pi
+
+    def simulate(self, T, start_idx=None):
+        idx = np.empty(T, dtype=int)
+
+        if start_idx is None:
+            idx[0] = self.rng.choice(self.n, p=self.stationary_dist)
+        else:
+            idx[0] = start_idx
+
+        for t in range(1, T):
+            idx[t] = self.rng.choice(self.n, p=self.P[idx[t - 1]])
+
+        x_path = self.grid[idx]
+        return x_path, idx
+
+    def simulate_ar1(self, T, start=0.0):
+        x = np.empty(T)
+        x[0] = start
+
+        for t in range(1, T):
+            eps = self.rng.normal()
+            x[t] = self.rho * x[t - 1] + self.sigma_eps * eps
+
+        return x
 
 # 1. The model ------------------------------------------------------------------
 
@@ -133,8 +240,12 @@ class CommodityModel:
         self.alpha = alpha
 
         # Rouwenhorst approximation for inflow process (note this is for x, where x = log(q) - log(mu), so mean is zero)
-        self.inflow_process = Rouwenhorst(
-            n=n_inflow_states, rho=inflow_rho, sigma_eps=inflow_sigma, seed=seed
+        self.inflow_process = Tauchen(
+            n=n_inflow_states,
+            rho=inflow_rho,
+            sigma_eps=inflow_sigma,
+            m=2.0,
+            seed=seed,
         )
         self.inflow_mean = inflow_mean
         self.q_grid = inflow_mean * np.exp(self.inflow_process.grid)
@@ -183,36 +294,71 @@ class CommodityModel:
         V = np.full((self.n_s, self.n_q), u)
         return V
 
-    def interp_weights(self, x):
+    def interp_weights(self, grid, x):
         """
-        Find x on self.s_grid and return idx, w such that:
-            f(x) = (1-w) f(s_grid[idx]) + w f(s_grid[idx+1])
+        Find idx, w such that:
+
+            f(x) ≈ (1-w) f(grid[idx]) + w f(grid[idx+1])
         """
-        # prep grid
+
+        grid = np.asarray(grid)
         x = np.asarray(x)
-        x = np.clip(x, self.s_grid[0], self.grid[-1])
-        # prep index
-        idx = np.searchsorted(self.s_grid, x) - 1
-        idx = np.clip(x, 0, self.n_s - 2)
-        # the two bounds
-        s_0 = self.s_grid[idx]
-        s_1 = self.s_grid[idx + 1]
-        w = (x - s_0) / (s_1 - s_0)
+        x = np.clip(x, grid[0], grid[-1])
+
+        idx = np.searchsorted(grid, x) - 1
+        idx = np.clip(idx, 0, len(grid) - 2)
+
+        x0 = grid[idx]
+        x1 = grid[idx + 1]
+
+        w = (x - x0) / (x1 - x0)
+
         return idx, w
-
-    def interp_1d_on_s(self, y, x):
+    
+    def interp_1d(self, grid, y, x):
         """
-        Interpolate y(s) at x.
-        """
-        idx, w = self.interp_weights(x)
-        return (1 - w) * y[idx] + w * y[idx + 1]
+        y is defined on grid.
 
-    def interp_2d_on_s(self, X, x):
-        """ "
-        Interpolate X(s,q) along s dimension at x. X is shape (n_s, n_q).
+        grid: shape (n,)
+        y:    shape (n,)
+        x:    scalar/vector/matrix of evaluation points
+        """
+
+        idx, w = self.interp_weights(grid, x)
+
+        y0 = y[idx]
+        y1 = y[idx + 1]
+
+        return (1 - w) * y0 + w * y1
+
+
+    def interp_axis0(self, grid, X, x):
+        """
+        Interpolate X along its first axis (the 's' dimension).
+
+        Economic meaning:
+        X is a function X(s, q) defined on a grid in s.
+        We want to evaluate X at off-grid points x (typically s'(s,q)),
+        while keeping all values across q.
+
+        Inputs:
+            grid : shape (n_s,)
+            The grid for s.
+
+            X : shape (n_s, n_q)
+            Function values X(s_i, q_j).
+
+            x : arbitrary shape (e.g. (n_s, n_q))
+            Points at which we want to evaluate X in the s-dimension.
+            In the model, this is usually s_policy(s,q).
+
+        Returns:
+            out : shape x.shape + (n_q,)
+                For each x, returns the full vector over q':
+                    out[..., j_q] = X(x, q_j)
 
         """
-        idx, w = self.interp_weights(x)
+        idx, w = self.interp_weights(grid, x)
         X_low = X[idx, :]
         X_high = X[idx + 1, :]
         return (1 - w[..., None]) * X_low + w[..., None] * X_high
@@ -221,7 +367,7 @@ class CommodityModel:
         """
         Given X(s,q) evaluate X(s'(s,q),q') for all q'.
         """
-        return self.interp_2d_on_s(X, self.s_policy)
+        return self.interp_axis0(self.s_grid, X, self.s_policy)
 
     def bellman_operator(self, V_old):
         V_new = np.zeros_like(V_old)
@@ -230,20 +376,10 @@ class CommodityModel:
         # precompute expected continuation value on the storage grid
         EV_on_grid = V_old @ self.P_q.T  # shape(n_s, n_q)
 
-        # interpolate E[V(s', q' = j) | q] as a function of s'
-        EV_interp = [
-            interp1d(
-                self.s_grid,
-                EV_on_grid[:, i_q],
-                kind="linear",
-                fill_value="extrapolate",
-            )
-            for i_q in range(self.n_q)
-        ]
-
         for i_s, s in enumerate(self.s_grid):
             for i_q, q in enumerate(self.q_grid):
                 upper = min(s + q, self.s_grid[-1])
+                lower = 0.0 if i_s == 0 else s_policy[i_s - 1, i_q]
 
                 def objective(s_next):
                     m = s + q - s_next
@@ -252,13 +388,17 @@ class CommodityModel:
 
                     c = self.production(m)
                     u = self.utility(c)
-                    EV = EV_interp[i_q](s_next)
+                    EV = self.interp_1d(
+                        self.s_grid,
+                        EV_on_grid[:, i_q],
+                        s_next
+                    )
 
                     return -(u + self.beta * EV)
 
                 result = minimize_scalar(
                     objective,
-                    bounds=(0.0, upper),
+                    bounds=(lower, upper),
                     method="bounded",
                     options={"xatol": 1e-5},
                 )
@@ -274,15 +414,6 @@ class CommodityModel:
 
         EV_on_grid = V_old @ self.P_q.T
 
-        EV_interp = [
-            interp1d(
-                self.s_grid,
-                EV_on_grid[:, i_q],
-                kind="linear",
-                fill_value="extrapolate",
-            )
-            for i_q in range(self.n_q)
-        ]
 
         for i_s, s in enumerate(self.s_grid):
             for i_q, q in enumerate(self.q_grid):
@@ -293,9 +424,13 @@ class CommodityModel:
                     V_new[i_s, i_q] = -1e10
                 else:
                     c = self.production(m)
-                    V_new[i_s, i_q] = self.utility(c) + self.beta * EV_interp[i_q](
+                    EV = self.interp_1d(
+                        self.s_grid,
+                        EV_on_grid[:, i_q],
                         s_next
                     )
+                
+                V_new[i_s, i_q] = self.utility(c) + self.beta * EV
 
         return V_new
 
@@ -341,45 +476,17 @@ class CommodityModel:
         # p_s(s,q) u_c(c)= beta * E[ u_c(c') p_s(s',q')|s,q]+delta(s,q)
         # A = beta * E[A'|s,q] + delta(s,q)
         A = u_c * p_s
-        A_interp = [
-            interp1d(
-                self.s_grid,
-                A[:, i_q],
-                kind="linear",
-                fill_value="extrapolate",
-            )
-            for i_q in range(self.n_q)
-        ]
-        A_next = np.zeros((self.n_s, self.n_q, self.n_q))
-        for i_q_next in range(self.n_q):
-            A_next[:, :, i_q_next] = A_interp[i_q_next](self.s_policy)
+        # A_next[i_s, i_q, j_q] = A(s'(s,q), q'_j)
+        A_next = self.eval_next_by_q(A)
+
         # expectation over q' conditional on current q
-        EA = np.einsum("ijk,jk->ij", A_next, self.P_q)
+        EA = np.sum(self.P_q[None, :, :] * A_next, axis=2)
         delta = p_s - self.beta * EA / u_c
         self.convenience_yield = np.maximum(delta, 0.0)
         self.expected_Mp_next = p_s - delta
 
         return self
 
-    def eval_next_by_q(self, X):
-        """
-        Given X with shape (n_s, n_q), return X_next with shape (n_s, n_q, n_q),
-        where X_next[i_s, i_q, j_q] = X(s_policy[i_s, i_q], q'_j).
-        """
-
-        X_next = np.zeros((self.n_s, self.n_q, self.n_q))
-
-        for j_q in range(self.n_q):
-            interp = interp1d(
-                self.s_grid,
-                X[:, j_q],
-                kind="linear",
-                fill_value="extrapolate",
-            )
-
-            X_next[:, :, j_q] = interp(self.s_policy)
-
-        return X_next
 
     def compute_futures_curves(self, T=12):
         n_s, n_q = self.n_s, self.n_q
@@ -438,15 +545,18 @@ model = CommodityModel(
     crra=2.0,
     beta=0.95,
     alpha=0.5,
-    n_storage_states=200,
+    n_storage_states=400,
     inflow_mean=1.0,
-    inflow_rho=0.9,
-    inflow_sigma=0.2,
+    inflow_rho=0.85,
+    inflow_sigma=0.5,
     n_inflow_states=100,
     seed=42,
 )
 # solve
-model.bellman_solve().map_to_decentralised()
+with timer("Bellman solve"):
+    model.bellman_solve()
+# map to DCE    
+model.map_to_decentralised()
 
 # plots ----------------------------------
 
@@ -462,8 +572,6 @@ for i_q in indices:
     plt.plot(
         model.s_grid, model.s_policy[:, i_q], label=rf"$q = {model.q_grid[i_q]:.2f}$"
     )
-plt.xlim(0, 0.2)
-plt.ylim(0, 0.2)
 plt.xlabel(r"$s$")
 plt.ylabel(r"$s'(s,q)$")
 plt.title(r"Policy function $s'(s,q)$ for fixed $q$")
@@ -477,8 +585,6 @@ plt.figure(figsize=(8, 5))
 for i_q in indices:
     m = model.s_grid + model.q_grid[i_q] - model.s_policy[:, i_q]
     plt.plot(model.s_grid, m, label=rf"$q = {model.q_grid[i_q]:.2f}$")
-plt.xlim(0, 0.2)
-plt.ylim(0, 0.2)
 plt.xlabel(r"$s$")
 plt.ylabel(r"$m(s,q)$")
 plt.title(r"Commodity employed for production $m(s,q)$ for fixed $q$")
@@ -488,7 +594,7 @@ plt.savefig("m_policy.png", dpi=300)
 plt.close()
 
 # where the constraint binds --------
-binding = model.s_policy < 1e-5
+binding = model.s_policy < 1e-3
 plt.figure(figsize=(8, 5))
 plt.imshow(
     binding.T,
