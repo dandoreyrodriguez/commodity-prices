@@ -2,3 +2,4 @@
 *.pdf
 rowenhurst.py
 rowenhurst.ipynb
+__pycache__*

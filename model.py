@@ -1,20 +1,23 @@
+
 ######################################################
 # A recursive model of commodity prices with storage #
+# Fast Numba version: no 5D arrays, no full futures  #
 ######################################################
 
+import time
+from contextlib import contextmanager
+from pathlib import Path
 
-# %%
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
-from math import comb
-from scipy.interpolate import interp1d
-from scipy.optimize import minimize_scalar
-import time
-from contextlib import contextmanager
-# 0. Rouwenhorst method for approximating AR(1) processes ----------------
+from numba import njit, prange
 
-# %%
+
+# ============================================================
+# utilities
+# ============================================================
+
 @contextmanager
 def timer(name):
     start = time.perf_counter()
@@ -22,127 +25,16 @@ def timer(name):
     end = time.perf_counter()
     print(f"{name}: {end - start:.4f} sec")
 
-#%% 
-class Rouwenhorst:
-    def __init__(self, n, rho, sigma_eps, seed=None):
-        """
-        Approximate AR(1):
-            z_{t+1} = rho z_t + sigma_eps eps_{t+1}
-
-        Parameters
-        ----------
-        n : int
-            Number of grid points.
-        rho : float
-            AR(1) persistence.
-        sigma_eps : float
-            Innovation standard deviation.
-        seed : int or None
-            Random seed.
-        """
-        self.m = n - 1  # number of binary flips
-        self.rho = rho
-        self.sigma_eps = sigma_eps
-        self.rng = np.random.default_rng(seed)
-
-        self.p = (1 + rho) / 2  # probability of staying in the same state
-        self.sigma_z = sigma_eps / np.sqrt(1 - rho**2)
-
-        self.P = self._build_transition()
-        self.grid = self._build_grid()
-        self.stationary_dist = self._stationary_distribution()
-
-    def _build_transition(self):
-        """Build the transition matrix using Rouwenhorst's method."""
-        m = self.m
-        p = self.p
-
-        # Initialise with the single binary transition matrix
-        P = np.array([[p, 1 - p], [1 - p, p]])
-
-        # iterate
-        for j in range(2, m + 1):
-            # create transition matrix, must be j+1 by j+1
-            P_new = np.zeros((j + 1, j + 1))
-            # top left
-            P_new[:-1, :-1] += p * P
-            # top right
-            P_new[:-1, 1:] += (1 - p) * P
-            # bottom left
-            P_new[1:, :-1] += (1 - p) * P
-            # bottom right
-            P_new[1:, 1:] += p * P
-            # normalise
-            P_new[1:-1, :] /= 2
-            P = P_new
-        # return P
-        return P
-
-    def _build_grid(self):
-        raw_grid = np.linspace(-self.m, self.m, self.m + 1)
-        z = self.sigma_z * raw_grid / np.sqrt(self.m)
-        return z
-
-    def _stationary_distribution(self):
-        pi = np.array([comb(self.m, k) * (0.5**self.m) for k in range(self.m + 1)])
-        return pi
-
-    def simulate(self, T, start_idx=None):
-        idx = np.empty(T, dtype=int)
-
-        if start_idx is None:
-            idx[0] = self.rng.choice(self.m + 1, p=self.stationary_dist)
-        else:
-            idx[0] = start_idx
-
-        for t in range(1, T):
-            idx[t] = self.rng.choice(self.m + 1, p=self.P[idx[t - 1]])
-
-        z_path = self.grid[idx]
-        return z_path, idx
-
-    def simulate_ar1(self, T, start=0.0):
-        z = np.empty(T)
-        z[0] = start
-
-        for t in range(1, T):
-            eps = self.rng.normal()
-            z[t] = self.rho * z[t - 1] + self.sigma_eps * eps
-
-        return z
-    
 
 class Tauchen:
     def __init__(self, n, rho, sigma_eps, m=3.0, seed=None):
-        """
-        Tauchen approximation to:
-
-            x_{t+1} = rho x_t + sigma_eps eps_{t+1}
-            eps ~ N(0,1)
-
-        Parameters
-        ----------
-        n : int
-            Number of grid points.
-        rho : float
-            Persistence.
-        sigma_eps : float
-            Innovation standard deviation.
-        m : float
-            Width of grid in unconditional standard deviations.
-            Usually 2.5 or 3.0.
-        seed : int or None
-            Random seed.
-        """
-
-        self.n = n
-        self.rho = rho
-        self.sigma_eps = sigma_eps
-        self.m = m
+        self.n = int(n)
+        self.rho = float(rho)
+        self.sigma_eps = float(sigma_eps)
+        self.m = float(m)
         self.rng = np.random.default_rng(seed)
 
-        self.sigma_x = sigma_eps / np.sqrt(1 - rho**2)
-
+        self.sigma_x = self.sigma_eps / np.sqrt(1.0 - self.rho**2)
         self.grid = self._build_grid()
         self.P = self._build_transition()
         self.stationary_dist = self._stationary_distribution()
@@ -161,16 +53,14 @@ class Tauchen:
 
             for j, x_next in enumerate(self.grid):
                 if j == 0:
-                    upper = (x_next + step / 2 - mean_next) / self.sigma_eps
+                    upper = (x_next + step / 2.0 - mean_next) / self.sigma_eps
                     P[i, j] = norm.cdf(upper)
-
                 elif j == self.n - 1:
-                    lower = (x_next - step / 2 - mean_next) / self.sigma_eps
-                    P[i, j] = 1 - norm.cdf(lower)
-
+                    lower = (x_next - step / 2.0 - mean_next) / self.sigma_eps
+                    P[i, j] = 1.0 - norm.cdf(lower)
                 else:
-                    upper = (x_next + step / 2 - mean_next) / self.sigma_eps
-                    lower = (x_next - step / 2 - mean_next) / self.sigma_eps
+                    upper = (x_next + step / 2.0 - mean_next) / self.sigma_eps
+                    lower = (x_next - step / 2.0 - mean_next) / self.sigma_eps
                     P[i, j] = norm.cdf(upper) - norm.cdf(lower)
 
         return P
@@ -178,522 +68,1159 @@ class Tauchen:
     def _stationary_distribution(self):
         eigvals, eigvecs = np.linalg.eig(self.P.T)
         idx = np.argmin(np.abs(eigvals - 1.0))
-
         pi = np.real(eigvecs[:, idx])
         pi = pi / pi.sum()
+        pi = np.maximum(pi, 0.0)
+        return pi / pi.sum()
 
-        # avoid tiny negative numerical noise
-        pi = np.maximum(pi, 0)
-        pi = pi / pi.sum()
 
-        return pi
+# ============================================================
+# Numba kernels
+# ============================================================
 
-    def simulate(self, T, start_idx=None):
-        idx = np.empty(T, dtype=int)
+@njit(cache=True)
+def _interp_idx_weight(grid, x):
+    n = grid.shape[0]
 
-        if start_idx is None:
-            idx[0] = self.rng.choice(self.n, p=self.stationary_dist)
+    if x <= grid[0]:
+        return 0, 0.0
+    if x >= grid[n - 1]:
+        return n - 2, 1.0
+
+    lo = 0
+    hi = n - 1
+
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if grid[mid] <= x:
+            lo = mid
         else:
-            idx[0] = start_idx
+            hi = mid
 
-        for t in range(1, T):
-            idx[t] = self.rng.choice(self.n, p=self.P[idx[t - 1]])
+    w = (x - grid[lo]) / (grid[lo + 1] - grid[lo])
+    return lo, w
 
-        x_path = self.grid[idx]
-        return x_path, idx
 
-    def simulate_ar1(self, T, start=0.0):
-        x = np.empty(T)
-        x[0] = start
+@njit(cache=True, parallel=True)
+def _compute_ee_values(s_grid, q_grid, z_grid, s_policy, alpha, crra):
+    n_s, n_q, n_z = s_policy.shape
+    EE = np.empty((n_s, n_q, n_z))
 
-        for t in range(1, T):
-            eps = self.rng.normal()
-            x[t] = self.rho * x[t - 1] + self.sigma_eps * eps
+    for i_s in prange(n_s):
+        s = s_grid[i_s]
+        for i_q in range(n_q):
+            q = q_grid[i_q]
+            for i_z in range(n_z):
+                z = z_grid[i_z]
+                m = s + q - s_policy[i_s, i_q, i_z]
+                if m < 1e-12:
+                    m = 1e-12
 
-        return x
+                c = z * m**alpha
+                p = alpha * z * m**(alpha - 1.0)
+                EE[i_s, i_q, i_z] = c**(-crra) * p
 
-# 1. The model ------------------------------------------------------------------
+    return EE
 
+
+@njit(cache=True, parallel=True)
+def _markov_expect_exog(X, P_q, P_z):
+    """
+    E[X(s, q', z') | q, z].
+    Uses independence of q and z. Does not form kron(P_q, P_z).
+    """
+    n_s, n_q, n_z = X.shape
+    tmp = np.empty((n_s, n_q, n_z))
+    out = np.empty((n_s, n_q, n_z))
+
+    # integrate over z'
+    for i_s in prange(n_s):
+        for j_q in range(n_q):
+            for i_z in range(n_z):
+                acc = 0.0
+                for j_z in range(n_z):
+                    acc += P_z[i_z, j_z] * X[i_s, j_q, j_z]
+                tmp[i_s, j_q, i_z] = acc
+
+    # integrate over q'
+    for i_s in prange(n_s):
+        for i_q in range(n_q):
+            for i_z in range(n_z):
+                acc = 0.0
+                for j_q in range(n_q):
+                    acc += P_q[i_q, j_q] * tmp[i_s, j_q, i_z]
+                out[i_s, i_q, i_z] = acc
+
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _expect_next_policy(X, s_policy, s_grid, P_q, P_z):
+    """
+    E[X(s'(s,q,z), q', z') | q,z].
+    No 5D array.
+    """
+    EX_nodes = _markov_expect_exog(X, P_q, P_z)
+    n_s, n_q, n_z = X.shape
+    out = np.empty((n_s, n_q, n_z))
+
+    for i_s in prange(n_s):
+        for i_q in range(n_q):
+            for i_z in range(n_z):
+                s_next = s_policy[i_s, i_q, i_z]
+                idx, w = _interp_idx_weight(s_grid, s_next)
+                out[i_s, i_q, i_z] = (
+                    (1.0 - w) * EX_nodes[idx, i_q, i_z]
+                    + w * EX_nodes[idx + 1, i_q, i_z]
+                )
+
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _egm_step(EE, s_grid, q_grid, z_grid, P_q, P_z, beta, alpha, crra):
+    RHS = beta * _markov_expect_exog(EE, P_q, P_z)
+
+    n_s, n_q, n_z = EE.shape
+    s_implied = np.empty((n_s, n_q, n_z))
+    theta = alpha * (1.0 - crra) - 1.0
+
+    for i_s in prange(n_s):
+        s_prime = s_grid[i_s]
+        for i_q in range(n_q):
+            q = q_grid[i_q]
+            for i_z in range(n_z):
+                z = z_grid[i_z]
+                denom = alpha * z**(1.0 - crra)
+                m = (RHS[i_s, i_q, i_z] / denom)**(1.0 / theta)
+                s_implied[i_s, i_q, i_z] = m + s_prime - q
+
+    return s_implied
+
+
+@njit(cache=True)
+def _interp_sorted_1d(x_grid_sorted, y_sorted, x):
+    n = x_grid_sorted.shape[0]
+
+    if x <= x_grid_sorted[0]:
+        return y_sorted[0]
+    if x >= x_grid_sorted[n - 1]:
+        return y_sorted[n - 1]
+
+    lo = 0
+    hi = n - 1
+
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if x_grid_sorted[mid] <= x:
+            lo = mid
+        else:
+            hi = mid
+
+    w = (x - x_grid_sorted[lo]) / (x_grid_sorted[lo + 1] - x_grid_sorted[lo])
+    return (1.0 - w) * y_sorted[lo] + w * y_sorted[lo + 1]
+
+
+@njit(cache=True, parallel=True)
+def _egm_interpolate(s_implied, s_grid, q_grid):
+    n_s, n_q, n_z = s_implied.shape
+    out = np.empty((n_s, n_q, n_z))
+
+    for i_q in prange(n_q):
+        q = q_grid[i_q]
+        for i_z in range(n_z):
+            sort_idx = np.argsort(s_implied[:, i_q, i_z])
+
+            s_impl_sorted = np.empty(n_s)
+            s_prime_sorted = np.empty(n_s)
+
+            for k in range(n_s):
+                j = sort_idx[k]
+                s_impl_sorted[k] = s_implied[j, i_q, i_z]
+                s_prime_sorted[k] = s_grid[j]
+
+            threshold = s_impl_sorted[0]
+
+            for i_s in range(n_s):
+                s = s_grid[i_s]
+
+                if s <= threshold:
+                    pol = 0.0
+                else:
+                    pol = _interp_sorted_1d(s_impl_sorted, s_prime_sorted, s)
+
+                upper = s + q
+
+                if pol > upper:
+                    pol = upper
+                if pol < 0.0:
+                    pol = 0.0
+                if pol > s_grid[n_s - 1]:
+                    pol = s_grid[n_s - 1]
+
+                out[i_s, i_q, i_z] = pol
+
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _compute_p_uc_m(s_grid, q_grid, z_grid, s_policy, alpha, crra):
+    n_s, n_q, n_z = s_policy.shape
+
+    m = np.empty((n_s, n_q, n_z))
+    p = np.empty((n_s, n_q, n_z))
+    uc = np.empty((n_s, n_q, n_z))
+
+    for i_s in prange(n_s):
+        s = s_grid[i_s]
+        for i_q in range(n_q):
+            q = q_grid[i_q]
+            for i_z in range(n_z):
+                z = z_grid[i_z]
+
+                mm = s + q - s_policy[i_s, i_q, i_z]
+                if mm < 1e-12:
+                    mm = 1e-12
+
+                c = z * mm**alpha
+
+                m[i_s, i_q, i_z] = mm
+                p[i_s, i_q, i_z] = alpha * z * mm**(alpha - 1.0)
+                uc[i_s, i_q, i_z] = c**(-crra)
+
+    return m, p, uc
+
+
+@njit(cache=True, parallel=True)
+def _convenience_yield_kernel(p, uc, s_policy, s_grid, P_q, P_z, beta):
+    A = uc * p
+    EA = _expect_next_policy(A, s_policy, s_grid, P_q, P_z)
+
+    n_s, n_q, n_z = p.shape
+    delta = np.empty((n_s, n_q, n_z))
+
+    for i_s in prange(n_s):
+        for i_q in range(n_q):
+            for i_z in range(n_z):
+                d = p[i_s, i_q, i_z] - beta * EA[i_s, i_q, i_z] / uc[i_s, i_q, i_z]
+                if d < 0.0:
+                    d = 0.0
+                delta[i_s, i_q, i_z] = d
+
+    return delta
+
+
+@njit(cache=True)
+def _futures_curve_at_state(
+    price_s, uc, s_policy, s_grid, P_q, P_z, beta,
+    i_s0, i_q0, i_z0, T
+):
+    """
+    One futures curve at one initial state.
+    Uses 3D continuation arrays internally, but stores only T+1 output.
+    """
+    F = np.empty(T + 1)
+    Ep = np.empty(T + 1)
+    wedge = np.empty(T + 1)
+
+    B_prev = price_s.copy()
+    D_prev = np.ones_like(price_s)
+    Ep_prev = price_s.copy()
+
+    F[0] = price_s[i_s0, i_q0, i_z0]
+    Ep[0] = price_s[i_s0, i_q0, i_z0]
+    wedge[0] = 0.0
+
+    for h in range(1, T + 1):
+        EB = _expect_next_policy(uc * B_prev, s_policy, s_grid, P_q, P_z)
+        ED = _expect_next_policy(uc * D_prev, s_policy, s_grid, P_q, P_z)
+        EEp = _expect_next_policy(Ep_prev, s_policy, s_grid, P_q, P_z)
+
+        B_new = beta * EB / uc
+        D_new = beta * ED / uc
+        Ep_new = EEp
+        F_grid = B_new / D_new
+
+        F[h] = F_grid[i_s0, i_q0, i_z0]
+        Ep[h] = Ep_new[i_s0, i_q0, i_z0]
+        wedge[h] = F[h] - Ep[h]
+
+        B_prev = B_new
+        D_prev = D_new
+        Ep_prev = Ep_new
+
+    return F, Ep, wedge
+
+
+@njit(cache=True)
+def _futures_surface_fixed_z_at_horizon(
+    price_s, uc, s_policy, s_grid, P_q, P_z, beta, i_z_fixed, T
+):
+    """
+    2D map over current (s,q), holding current z fixed.
+    Output shape: (n_s,n_q)
+    """
+    B_prev = price_s.copy()
+    D_prev = np.ones_like(price_s)
+    Ep_prev = price_s.copy()
+
+    if T == 0:
+        F_2d = price_s[:, :, i_z_fixed].copy()
+        Ep_2d = price_s[:, :, i_z_fixed].copy()
+        return F_2d, Ep_2d, np.zeros_like(F_2d)
+
+    F_grid = price_s.copy()
+    Ep_new = price_s.copy()
+
+    for h in range(1, T + 1):
+        EB = _expect_next_policy(uc * B_prev, s_policy, s_grid, P_q, P_z)
+        ED = _expect_next_policy(uc * D_prev, s_policy, s_grid, P_q, P_z)
+        EEp = _expect_next_policy(Ep_prev, s_policy, s_grid, P_q, P_z)
+
+        B_new = beta * EB / uc
+        D_new = beta * ED / uc
+        Ep_new = EEp
+        F_grid = B_new / D_new
+
+        B_prev = B_new
+        D_prev = D_new
+        Ep_prev = Ep_new
+
+    F_2d = F_grid[:, :, i_z_fixed].copy()
+    Ep_2d = Ep_new[:, :, i_z_fixed].copy()
+    wedge_2d = F_2d - Ep_2d
+
+    return F_2d, Ep_2d, wedge_2d
+
+
+@njit(cache=True)
+def _futures_surface_fixed_q_at_horizon(
+    price_s, uc, s_policy, s_grid, P_q, P_z, beta, i_q_fixed, T
+):
+    """
+    2D map over current (s,z), holding current q fixed.
+    Output shape: (n_s,n_z)
+    """
+    B_prev = price_s.copy()
+    D_prev = np.ones_like(price_s)
+    Ep_prev = price_s.copy()
+
+    if T == 0:
+        F_2d = price_s[:, i_q_fixed, :].copy()
+        Ep_2d = price_s[:, i_q_fixed, :].copy()
+        return F_2d, Ep_2d, np.zeros_like(F_2d)
+
+    F_grid = price_s.copy()
+    Ep_new = price_s.copy()
+
+    for h in range(1, T + 1):
+        EB = _expect_next_policy(uc * B_prev, s_policy, s_grid, P_q, P_z)
+        ED = _expect_next_policy(uc * D_prev, s_policy, s_grid, P_q, P_z)
+        EEp = _expect_next_policy(Ep_prev, s_policy, s_grid, P_q, P_z)
+
+        B_new = beta * EB / uc
+        D_new = beta * ED / uc
+        Ep_new = EEp
+        F_grid = B_new / D_new
+
+        B_prev = B_new
+        D_prev = D_new
+        Ep_prev = Ep_new
+
+    F_2d = F_grid[:, i_q_fixed, :].copy()
+    Ep_2d = Ep_new[:, i_q_fixed, :].copy()
+    wedge_2d = F_2d - Ep_2d
+
+    return F_2d, Ep_2d, wedge_2d
+
+
+@njit(cache=True)
+def _futures_surface_fixed_s_at_horizon(
+    price_s, uc, s_policy, s_grid, P_q, P_z, beta, i_s_fixed, T
+):
+    """
+    2D map over current (q,z), holding current s fixed.
+    Output shape: (n_q,n_z)
+    """
+    B_prev = price_s.copy()
+    D_prev = np.ones_like(price_s)
+    Ep_prev = price_s.copy()
+
+    if T == 0:
+        F_2d = price_s[i_s_fixed, :, :].copy()
+        Ep_2d = price_s[i_s_fixed, :, :].copy()
+        return F_2d, Ep_2d, np.zeros_like(F_2d)
+
+    F_grid = price_s.copy()
+    Ep_new = price_s.copy()
+
+    for h in range(1, T + 1):
+        EB = _expect_next_policy(uc * B_prev, s_policy, s_grid, P_q, P_z)
+        ED = _expect_next_policy(uc * D_prev, s_policy, s_grid, P_q, P_z)
+        EEp = _expect_next_policy(Ep_prev, s_policy, s_grid, P_q, P_z)
+
+        B_new = beta * EB / uc
+        D_new = beta * ED / uc
+        Ep_new = EEp
+        F_grid = B_new / D_new
+
+        B_prev = B_new
+        D_prev = D_new
+        Ep_prev = Ep_new
+
+    F_2d = F_grid[i_s_fixed, :, :].copy()
+    Ep_2d = Ep_new[i_s_fixed, :, :].copy()
+    wedge_2d = F_2d - Ep_2d
+
+    return F_2d, Ep_2d, wedge_2d
+
+
+# ============================================================
+# model
+# ============================================================
 
 class CommodityModel:
-
     def __init__(
         self,
         crra,
         beta,
         alpha,
-        n_storage_states=50,
-        storage_max_multiple=3.0,
+        n_storage_states=100,
+        storage_max_multiple=4.0,
         storage_curvature=3.0,
         inflow_mean=0.1,
         inflow_rho=0.9,
         inflow_sigma=0.1,
         n_inflow_states=20,
+        productivity_mean=1.0,
+        productivity_rho=0.9,
+        productivity_sigma=0.05,
+        n_productivity_states=20,
         seed=None,
     ):
+        self.crra = float(crra)
+        self.beta = float(beta)
+        self.alpha = float(alpha)
 
-        # consumer preferences
-        self.crra = crra
-        self.beta = beta
+        seed_q = seed
+        seed_z = None if seed is None else seed + 1
 
-        # firm technology
-        self.alpha = alpha
-
-        # Rouwenhorst approximation for inflow process (note this is for x, where x = log(q) - log(mu), so mean is zero)
         self.inflow_process = Tauchen(
             n=n_inflow_states,
             rho=inflow_rho,
             sigma_eps=inflow_sigma,
             m=2.0,
-            seed=seed,
+            seed=seed_q,
         )
-        self.inflow_mean = inflow_mean
-        self.q_grid = inflow_mean * np.exp(self.inflow_process.grid)
-        self.P_q = self.inflow_process.P
+        self.inflow_mean = float(inflow_mean)
+        self.q_grid = np.ascontiguousarray(self.inflow_mean * np.exp(self.inflow_process.grid))
+        self.P_q = np.ascontiguousarray(self.inflow_process.P)
         self.stationary_dist_q = self.inflow_process.stationary_dist
-        self.n_q = n_inflow_states
+        self.n_q = int(n_inflow_states)
 
-        # set up storage grid
-        self.n_s = n_storage_states
-        self.storage_max_multiple = storage_max_multiple
-        s_max = storage_max_multiple * inflow_mean
-        self.s_grid = self.make_storage_grid(s_max, n_storage_states, storage_curvature)
-        self.storage_curvature = storage_curvature
-        # initialise value function
-        self.V = np.zeros((self.n_s, self.n_q))
-        # initialise policy function
-        self.s_policy = np.zeros((self.n_s, self.n_q))
-        # initialise commodity employed for production
-        self.m_policy = np.zeros((self.n_s, self.n_q))
-        # initialise the convenience yield
-        self.convenience_yield = np.zeros((self.n_s, self.n_q))
+        self.productivity_process = Tauchen(
+            n=n_productivity_states,
+            rho=productivity_rho,
+            sigma_eps=productivity_sigma,
+            m=2.0,
+            seed=seed_z,
+        )
+        self.productivity_mean = float(productivity_mean)
+        self.z_grid = np.ascontiguousarray(self.productivity_mean * np.exp(self.productivity_process.grid))
+        self.P_z = np.ascontiguousarray(self.productivity_process.P)
+        self.stationary_dist_z = self.productivity_process.stationary_dist
+        self.n_z = int(n_productivity_states)
 
-    def make_storage_grid(self, s_max, n_s, curvature):
+        self.n_s = int(n_storage_states)
+        self.storage_max_multiple = float(storage_max_multiple)
+        self.storage_curvature = float(storage_curvature)
+
+        s_max = self.storage_max_multiple * self.inflow_mean
+        self.s_grid = np.ascontiguousarray(self.make_storage_grid(s_max, self.n_s, self.storage_curvature))
+
+        shape = (self.n_s, self.n_q, self.n_z)
+        self.s_policy = np.zeros(shape)
+        self.m_policy = np.zeros(shape)
+        self.price_s = np.zeros(shape)
+        self.u_c = np.zeros(shape)
+        self.convenience_yield = np.zeros(shape)
+        self.expected_Mp_next = np.zeros(shape)
+
+    @staticmethod
+    def make_storage_grid(s_max, n_s, curvature):
         x = np.linspace(0.0, 1.0, n_s)
         return s_max * x**curvature
 
-    def utility(self, c):
-        if self.crra == 1:
-            return np.log(c)
-        else:
-            return (c ** (1 - self.crra) - 1) / (1 - self.crra)
+    def solve_egm(self, tol=1e-6, max_iter=500, verbose=True):
+        s = self.s_grid[:, None, None]
+        q = self.q_grid[None, :, None]
 
-    def production(self, s):
-        return s**self.alpha
+        # IMPORTANT: broadcast initial guess to full (s,q,z).
+        # Without this, the model silently has z dimension 1.
+        s_policy0 = np.clip(0.5 * (s + q), 0.0, self.s_grid[-1])
+        s_policy = np.ascontiguousarray(
+            np.broadcast_to(s_policy0, (self.n_s, self.n_q, self.n_z)).copy()
+        )
 
-    def marginal_utility(self, c):
-        return c ** (-self.crra)
-
-    def marginal_product(self, s):
-        return self.alpha * s ** (self.alpha - 1)
-
-    def V_0(self):
-        # use c = F(mean_inflow) as initial guess for consumption in value function
-        c = self.production(self.inflow_mean)
-        u = self.utility(c) / (1 - self.beta)
-        V = np.full((self.n_s, self.n_q), u)
-        return V
-
-    def interp_weights(self, grid, x):
-        """
-        Find idx, w such that:
-
-            f(x) ≈ (1-w) f(grid[idx]) + w f(grid[idx+1])
-        """
-
-        grid = np.asarray(grid)
-        x = np.asarray(x)
-        x = np.clip(x, grid[0], grid[-1])
-
-        idx = np.searchsorted(grid, x) - 1
-        idx = np.clip(idx, 0, len(grid) - 2)
-
-        x0 = grid[idx]
-        x1 = grid[idx + 1]
-
-        w = (x - x0) / (x1 - x0)
-
-        return idx, w
-    
-    def interp_1d(self, grid, y, x):
-        """
-        y is defined on grid.
-
-        grid: shape (n,)
-        y:    shape (n,)
-        x:    scalar/vector/matrix of evaluation points
-        """
-
-        idx, w = self.interp_weights(grid, x)
-
-        y0 = y[idx]
-        y1 = y[idx + 1]
-
-        return (1 - w) * y0 + w * y1
-
-
-    def interp_axis0(self, grid, X, x):
-        """
-        Interpolate X along its first axis (the 's' dimension).
-
-        Economic meaning:
-        X is a function X(s, q) defined on a grid in s.
-        We want to evaluate X at off-grid points x (typically s'(s,q)),
-        while keeping all values across q.
-
-        Inputs:
-            grid : shape (n_s,)
-            The grid for s.
-
-            X : shape (n_s, n_q)
-            Function values X(s_i, q_j).
-
-            x : arbitrary shape (e.g. (n_s, n_q))
-            Points at which we want to evaluate X in the s-dimension.
-            In the model, this is usually s_policy(s,q).
-
-        Returns:
-            out : shape x.shape + (n_q,)
-                For each x, returns the full vector over q':
-                    out[..., j_q] = X(x, q_j)
-
-        """
-        idx, w = self.interp_weights(grid, x)
-        X_low = X[idx, :]
-        X_high = X[idx + 1, :]
-        return (1 - w[..., None]) * X_low + w[..., None] * X_high
-
-    def eval_next_by_q(self, X):
-        """
-        Given X(s,q) evaluate X(s'(s,q),q') for all q'.
-        """
-        return self.interp_axis0(self.s_grid, X, self.s_policy)
-
-    def bellman_operator(self, V_old):
-        V_new = np.zeros_like(V_old)
-        s_policy = np.zeros_like(self.s_policy)
-
-        # precompute expected continuation value on the storage grid
-        EV_on_grid = V_old @ self.P_q.T  # shape(n_s, n_q)
-
-        for i_s, s in enumerate(self.s_grid):
-            for i_q, q in enumerate(self.q_grid):
-                upper = min(s + q, self.s_grid[-1])
-                lower = 0.0 if i_s == 0 else s_policy[i_s - 1, i_q]
-
-                def objective(s_next):
-                    m = s + q - s_next
-                    if m <= 0:
-                        return 1e10
-
-                    c = self.production(m)
-                    u = self.utility(c)
-                    EV = self.interp_1d(
-                        self.s_grid,
-                        EV_on_grid[:, i_q],
-                        s_next
-                    )
-
-                    return -(u + self.beta * EV)
-
-                result = minimize_scalar(
-                    objective,
-                    bounds=(lower, upper),
-                    method="bounded",
-                    options={"xatol": 1e-5},
-                )
-
-                V_new[i_s, i_q] = -result.fun
-                s_policy[i_s, i_q] = result.x
-
-        return V_new, s_policy
-
-    def policy_evaluation_step(self, V_old, s_policy):
-
-        V_new = np.zeros_like(V_old)
-
-        EV_on_grid = V_old @ self.P_q.T
-
-
-        for i_s, s in enumerate(self.s_grid):
-            for i_q, q in enumerate(self.q_grid):
-                s_next = s_policy[i_s, i_q]
-                m = s + q - s_next
-
-                if m <= 0:
-                    V_new[i_s, i_q] = -1e10
-                else:
-                    c = self.production(m)
-                    EV = self.interp_1d(
-                        self.s_grid,
-                        EV_on_grid[:, i_q],
-                        s_next
-                    )
-                
-                V_new[i_s, i_q] = self.utility(c) + self.beta * EV
-
-        return V_new
-
-    def bellman_solve(self, tol=1e-6, max_iter=1000, howard_iter=20):
-        V_old = self.V_0()
-        error = np.inf
+        error = 1.0
         iteration = 0
 
-        while error >= tol and iteration < max_iter:
+        while error > tol and iteration < max_iter:
+            EE = _compute_ee_values(
+                self.s_grid, self.q_grid, self.z_grid,
+                s_policy, self.alpha, self.crra
+            )
 
-            # expensive step: update policy
-            V_new, s_policy = self.bellman_operator(V_old)
+            s_implied = _egm_step(
+                EE,
+                self.s_grid,
+                self.q_grid,
+                self.z_grid,
+                self.P_q,
+                self.P_z,
+                self.beta,
+                self.alpha,
+                self.crra,
+            )
 
-            # cheap steps: evaluate fixed policy
-            for _ in range(howard_iter):
-                V_new = self.policy_evaluation_step(V_new, s_policy)
+            s_policy_new = _egm_interpolate(s_implied, self.s_grid, self.q_grid)
 
-            error = np.max(np.abs(V_new - V_old))
-            V_old = V_new
+            error = float(np.max(np.abs(s_policy_new - s_policy)))
+            s_policy = np.ascontiguousarray(s_policy_new)
             iteration += 1
 
-            if iteration % 5 == 0:
-                print(f"Iteration {iteration}, error = {error:.3e}")
+            if verbose and iteration % 25 == 0:
+                print(f"Iteration {iteration}, policy error = {error:.3e}")
 
-        print(f"Stopped after {iteration} iterations, error = {error:.3e}")
+        if verbose:
+            print(f"Stopped after {iteration} iterations, error = {error:.3e}")
 
-        self.V = V_new
         self.s_policy = s_policy
+        self.m_policy = np.maximum(
+            self.s_grid[:, None, None] + self.q_grid[None, :, None] - self.s_policy,
+            1e-12,
+        )
 
         return self
 
     def map_to_decentralised(self):
-
-        # m(s,q) = s + q - s'(s,q)
-        m = self.s_grid[:, None] + self.q_grid[None, :] - self.s_policy
-        self.m_policy = m
-        # the commodity price p(s,q) = F_m(m(s,q))
-        p_s = self.marginal_product(m)
-        self.price_s = p_s
-        # get MU of consumption at the optimal policy
-        c = self.production(m)
-        u_c = self.marginal_utility(c)
-        # p_s(s,q) u_c(c)= beta * E[ u_c(c') p_s(s',q')|s,q]+delta(s,q)
-        # A = beta * E[A'|s,q] + delta(s,q)
-        A = u_c * p_s
-        # A_next[i_s, i_q, j_q] = A(s'(s,q), q'_j)
-        A_next = self.eval_next_by_q(A)
-
-        # expectation over q' conditional on current q
-        EA = np.sum(self.P_q[None, :, :] * A_next, axis=2)
-        delta = p_s - self.beta * EA / u_c
-        self.convenience_yield = np.maximum(delta, 0.0)
-        self.expected_Mp_next = p_s - delta
-
-        return self
-
-
-    def compute_futures_curves(self, T=12):
-        n_s, n_q = self.n_s, self.n_q
-
-        c = self.production(self.m_policy)
-        uc = self.marginal_utility(c)
-
-        F = np.zeros((n_s, n_q, T + 1))
-        Ep = np.zeros((n_s, n_q, T + 1))
-        wedge = np.zeros((n_s, n_q, T + 1))
-
-        B_prev = self.price_s.copy()
-        D_prev = np.ones_like(self.price_s)
-        Ep_prev = self.price_s.copy()
-
-        F[:, :, 0] = self.price_s
-        Ep[:, :, 0] = self.price_s
-
-        for h in range(1, T + 1):
-
-            uc_next = self.eval_next_by_q(uc)
-            B_next = self.eval_next_by_q(B_prev)
-            D_next = self.eval_next_by_q(D_prev)
-            Ep_next = self.eval_next_by_q(Ep_prev)
-
-            # M(s,q,q') = beta * uc(s',q') / uc(s,q)
-            M_next = self.beta * uc_next / uc[:, :, None]
-
-            # conditional probabilities P(q'|q), shape needs to broadcast over s
-            P = self.P_q[None, :, :]
-
-            B_new = np.sum(P * M_next * B_next, axis=2)
-            D_new = np.sum(P * M_next * D_next, axis=2)
-            Ep_new = np.sum(P * Ep_next, axis=2)
-
-            F[:, :, h] = B_new / D_new
-            Ep[:, :, h] = Ep_new
-            wedge[:, :, h] = F[:, :, h] - Ep[:, :, h]
-
-            B_prev = B_new
-            D_prev = D_new
-            Ep_prev = Ep_new
-
-        self.futures_curves = F
-        self.expected_spots = Ep
-        self.futures_wedge = wedge
-
-        return self
-
-
-# run the model and plot results -------------------------------------------------------
-
-# %%
-# initialise model
-model = CommodityModel(
-    crra=2.0,
-    beta=0.95,
-    alpha=0.5,
-    n_storage_states=400,
-    inflow_mean=1.0,
-    inflow_rho=0.85,
-    inflow_sigma=0.5,
-    n_inflow_states=100,
-    seed=42,
-)
-# solve
-with timer("Bellman solve"):
-    model.bellman_solve()
-# map to DCE    
-model.map_to_decentralised()
-
-# plots ----------------------------------
-
-
-# %%
-
-# pick some q states to plot
-indices = [0, 6, 9]
-
-# policy function s'(s, q = j) ---------------------
-plt.figure(figsize=(8, 5))
-for i_q in indices:
-    plt.plot(
-        model.s_grid, model.s_policy[:, i_q], label=rf"$q = {model.q_grid[i_q]:.2f}$"
-    )
-plt.xlabel(r"$s$")
-plt.ylabel(r"$s'(s,q)$")
-plt.title(r"Policy function $s'(s,q)$ for fixed $q$")
-plt.legend()
-plt.tight_layout()
-plt.savefig("s_policy.png", dpi=300)
-plt.close()
-
-# input to production m(s,q = j) = s + j - s'(s, q = j) ---------
-plt.figure(figsize=(8, 5))
-for i_q in indices:
-    m = model.s_grid + model.q_grid[i_q] - model.s_policy[:, i_q]
-    plt.plot(model.s_grid, m, label=rf"$q = {model.q_grid[i_q]:.2f}$")
-plt.xlabel(r"$s$")
-plt.ylabel(r"$m(s,q)$")
-plt.title(r"Commodity employed for production $m(s,q)$ for fixed $q$")
-plt.legend()
-plt.tight_layout()
-plt.savefig("m_policy.png", dpi=300)
-plt.close()
-
-# where the constraint binds --------
-binding = model.s_policy < 1e-3
-plt.figure(figsize=(8, 5))
-plt.imshow(
-    binding.T,
-    origin="lower",
-    aspect="auto",
-    extent=[model.s_grid[0], model.s_grid[-1], model.q_grid[0], model.q_grid[-1]],
-)
-plt.xlabel("s")
-plt.ylabel("q")
-plt.title("Region where storage constraint binds: s'(s,q)=0")
-plt.savefig("binding_heatmap.png", dpi=300)
-plt.close()
-
-# storage heatmap ----------
-plt.figure(figsize=(8, 5))
-plt.imshow(
-    model.s_policy.T,
-    origin="lower",
-    aspect="auto",
-    extent=[model.s_grid[0], model.s_grid[-1], model.q_grid[0], model.q_grid[-1]],
-)
-plt.xlabel("s")
-plt.ylabel("q")
-plt.title("Optimal storage policy s'(s,q)")
-plt.colorbar(label="s'")
-plt.savefig("storage_heatmap.png", dpi=300)
-plt.close()
-
-# commodity spot heatmap ----------
-plt.figure(figsize=(8, 5))
-plt.imshow(
-    model.price_s.T,
-    origin="lower",
-    aspect="auto",
-    extent=[model.s_grid[0], model.s_grid[-1], model.q_grid[0], model.q_grid[-1]],
-)
-plt.xlabel("s")
-plt.ylabel("q")
-plt.title(r"Commodity price function $p_s(s,q)$")
-plt.colorbar(label=r"$p_s$")
-plt.savefig("commodity_spot_heatmap.png", dpi=300)
-plt.close()
-
-# convenience yield spot heatmap ----------
-plt.figure(figsize=(8, 5))
-plt.imshow(
-    model.convenience_yield.T,
-    origin="lower",
-    aspect="auto",
-    extent=[model.s_grid[0], model.s_grid[-1], model.q_grid[0], model.q_grid[-1]],
-)
-plt.xlabel("s")
-plt.ylabel("q")
-plt.title(r"Convenience yield $\delta(s,q)$")
-plt.colorbar(label=r"$\delta$")
-plt.savefig("convenience_yield_heatmap.png", dpi=300)
-plt.close()
-
-
-# %%
-
-# building futures curves
-T = 3
-model.compute_futures_curves(T=T)
-# plot futures curves for some (s,q) pairs
-plt.figure(figsize=(8, 5))
-for i_q in [0]:
-    for i_s in [0, 9, 19]:
-        F = model.futures_curves[i_s, i_q, :]
-        plt.plot(
-            range(T + 1),
-            F,
-            label=rf"$s={model.s_grid[i_s]:.3f}, q={model.q_grid[i_q]:.2f}$",
+        self.m_policy, self.price_s, self.u_c = _compute_p_uc_m(
+            self.s_grid,
+            self.q_grid,
+            self.z_grid,
+            self.s_policy,
+            self.alpha,
+            self.crra,
         )
-plt.xlabel("Maturity (months)")
-plt.ylabel("Futures price")
-plt.title("Futures curves for different (s,q) pairs")
-plt.legend()
-plt.tight_layout()
-plt.savefig("futures_curves.png", dpi=300)
-plt.close()
 
-# plot futures curves for some (s,q) pairs
-for i in range(1, T + 1):
-    plt.figure(figsize=(8, 5))
-    plt.imshow(
-        model.futures_wedge[:, :, i].T,
-        origin="lower",
-        aspect="auto",
-        extent=[model.s_grid[0], model.s_grid[-1], model.q_grid[0], model.q_grid[-1]],
-    )
-    plt.xlabel("s")
-    plt.ylabel("q")
-    plt.title(
-        "Futures wedge, futures price minus expected spot, for maturity " + str(i)
-    )
-    plt.colorbar(label=r"$F - E[p|s,q]$")
+        self.convenience_yield = _convenience_yield_kernel(
+            self.price_s,
+            self.u_c,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            self.beta,
+        )
+
+        self.expected_Mp_next = self.price_s - self.convenience_yield
+
+        return self
+
+    def futures_curve_at_index(self, i_s, i_q, i_z, T=12):
+        F, Ep, wedge = _futures_curve_at_state(
+            self.price_s,
+            self.u_c,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            self.beta,
+            int(i_s),
+            int(i_q),
+            int(i_z),
+            int(T),
+        )
+
+        return {
+            "maturity": np.arange(T + 1),
+            "F": F,
+            "Ep": Ep,
+            "wedge": wedge,
+        }
+
+    def futures_curve_at_values(self, s, q, z, T=12):
+        i_s = nearest_index(self.s_grid, s)
+        i_q = nearest_index(self.q_grid, q)
+        i_z = nearest_index(self.z_grid, z)
+
+        out = self.futures_curve_at_index(i_s, i_q, i_z, T=T)
+        out.update({
+            "i_s": i_s,
+            "i_q": i_q,
+            "i_z": i_z,
+            "s": self.s_grid[i_s],
+            "q": self.q_grid[i_q],
+            "z": self.z_grid[i_z],
+        })
+        return out
+
+    def futures_surface_fixed_z(self, i_z, T=12, object_name="wedge"):
+        F, Ep, W = _futures_surface_fixed_z_at_horizon(
+            self.price_s,
+            self.u_c,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            self.beta,
+            int(i_z),
+            int(T),
+        )
+        return _select_object(F, Ep, W, object_name)
+
+    def futures_surface_fixed_q(self, i_q, T=12, object_name="wedge"):
+        F, Ep, W = _futures_surface_fixed_q_at_horizon(
+            self.price_s,
+            self.u_c,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            self.beta,
+            int(i_q),
+            int(T),
+        )
+        return _select_object(F, Ep, W, object_name)
+
+    def futures_surface_fixed_s(self, i_s, T=12, object_name="wedge"):
+        F, Ep, W = _futures_surface_fixed_s_at_horizon(
+            self.price_s,
+            self.u_c,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            self.beta,
+            int(i_s),
+            int(T),
+        )
+        return _select_object(F, Ep, W, object_name)
+
+
+# ============================================================
+# plotting helpers
+# ============================================================
+
+def _select_object(F, Ep, W, object_name):
+    if object_name == "F":
+        return F
+    if object_name == "Ep":
+        return Ep
+    if object_name == "wedge":
+        return W
+    raise ValueError("object_name must be 'F', 'Ep', or 'wedge'")
+
+
+def nearest_index(grid, value):
+    return int(np.argmin(np.abs(grid - value)))
+
+
+def quantile_indices(grid, probs):
+    return [nearest_index(grid, np.quantile(grid, p)) for p in probs]
+
+
+def savefig(filename, fig_dir="figures"):
+    Path(fig_dir).mkdir(exist_ok=True)
     plt.tight_layout()
-    plt.savefig(f"futures_wedge_{i}.png", dpi=300)
+    plt.savefig(Path(fig_dir) / filename, dpi=300, bbox_inches="tight")
     plt.close()
 
-# %%
+
+def plot_heatmap_s_q_fixed_z(model, X, i_z, label, title, filename):
+    """
+    Plot any 3D object X(s,q,z) as an s-q heatmap holding z fixed.
+    """
+    plt.figure(figsize=(8, 5))
+    plt.imshow(
+        X[:, :, i_z].T,
+        origin="lower",
+        aspect="auto",
+        extent=[
+            model.s_grid[0],
+            model.s_grid[-1],
+            model.q_grid[0],
+            model.q_grid[-1],
+        ],
+    )
+    plt.xlabel(r"$s$")
+    plt.ylabel(r"$q$")
+    plt.title(title + rf", fixed $z={model.z_grid[i_z]:.3f}$")
+    plt.colorbar(label=label)
+    savefig(filename)
+
+
+def plot_lines_vary_q_fixed_z(
+    model, X, i_z, ylabel, title, filename,
+    q_probs=(0.10, 0.50, 0.90)
+):
+    """
+    Line plot against s. Hold z fixed. Vary q.
+    """
+    plt.figure(figsize=(8, 5))
+
+    for i_q in quantile_indices(model.q_grid, q_probs):
+        plt.plot(
+            model.s_grid,
+            X[:, i_q, i_z],
+            label=rf"$q={model.q_grid[i_q]:.3f}$",
+        )
+
+    plt.xlabel(r"$s$")
+    plt.ylabel(ylabel)
+    plt.title(title + rf", fixed $z={model.z_grid[i_z]:.3f}$")
+    plt.legend(frameon=False)
+    savefig(filename)
+
+
+def plot_lines_vary_z_fixed_q(
+    model, X, i_q, ylabel, title, filename,
+    z_probs=(0.10, 0.50, 0.90)
+):
+    """
+    Line plot against s. Hold q fixed. Vary z.
+    """
+    plt.figure(figsize=(8, 5))
+
+    for i_z in quantile_indices(model.z_grid, z_probs):
+        plt.plot(
+            model.s_grid,
+            X[:, i_q, i_z],
+            label=rf"$z={model.z_grid[i_z]:.3f}$",
+        )
+
+    plt.xlabel(r"$s$")
+    plt.ylabel(ylabel)
+    plt.title(title + rf", fixed $q={model.q_grid[i_q]:.3f}$")
+    plt.legend(frameon=False)
+    savefig(filename)
+
+
+# ------------------------------------------------------------
+# Futures plotting: F and expected spot on same chart
+# ------------------------------------------------------------
+
+def plot_futures_curve_F_vs_Ep(
+    model, i_s, i_q, i_z, T=12,
+    filename="futures_F_vs_Ep_curve.png"
+):
+    """
+    One state: plot futures price and expected future spot on same chart.
+    """
+    out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(out["maturity"], out["F"], marker="o", label=r"$F_{t,t+h}$")
+    plt.plot(out["maturity"], out["Ep"], marker="s", label=r"$E_t[p_{t+h}]$")
+    plt.axhline(
+        model.price_s[i_s, i_q, i_z],
+        linewidth=1,
+        linestyle="--",
+        label=r"$p_t$",
+    )
+
+    plt.xlabel("Maturity")
+    plt.ylabel("Price")
+    plt.title(
+        rf"Futures vs expected spot: "
+        rf"$s={model.s_grid[i_s]:.3f}$, "
+        rf"$q={model.q_grid[i_q]:.3f}$, "
+        rf"$z={model.z_grid[i_z]:.3f}$"
+    )
+    plt.legend(frameon=False)
+    savefig(filename)
+
+
+def plot_futures_F_vs_Ep_vary_q_fixed_sz(
+    model, i_s, i_z, T=12,
+    filename="futures_F_vs_Ep_vary_q_fixed_sz.png",
+    q_probs=(0.10, 0.50, 0.90)
+):
+    """
+    Multiple states: hold s,z fixed, vary q.
+    Each q gets two lines: F solid-marker-o, Ep dashed-marker-s.
+    """
+    plt.figure(figsize=(9, 5.5))
+    maturities = np.arange(T + 1)
+
+    for i_q in quantile_indices(model.q_grid, q_probs):
+        out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
+        q_label = rf"$q={model.q_grid[i_q]:.3f}$"
+
+        plt.plot(
+            maturities,
+            out["F"],
+            marker="o",
+            label=rf"$F$, {q_label}",
+        )
+        plt.plot(
+            maturities,
+            out["Ep"],
+            marker="s",
+            linestyle="--",
+            label=rf"$E[p]$, {q_label}",
+        )
+
+    plt.xlabel("Maturity")
+    plt.ylabel("Price")
+    plt.title(
+        rf"Futures vs expected spot, fixed "
+        rf"$s={model.s_grid[i_s]:.3f}$, "
+        rf"$z={model.z_grid[i_z]:.3f}$"
+    )
+    plt.legend(frameon=False, ncol=2)
+    savefig(filename)
+
+
+def plot_futures_F_vs_Ep_vary_z_fixed_sq(
+    model, i_s, i_q, T=12,
+    filename="futures_F_vs_Ep_vary_z_fixed_sq.png",
+    z_probs=(0.10, 0.50, 0.90)
+):
+    """
+    Multiple states: hold s,q fixed, vary z.
+    Each z gets two lines: F solid-marker-o, Ep dashed-marker-s.
+    """
+    plt.figure(figsize=(9, 5.5))
+    maturities = np.arange(T + 1)
+
+    for i_z in quantile_indices(model.z_grid, z_probs):
+        out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
+        z_label = rf"$z={model.z_grid[i_z]:.3f}$"
+
+        plt.plot(
+            maturities,
+            out["F"],
+            marker="o",
+            label=rf"$F$, {z_label}",
+        )
+        plt.plot(
+            maturities,
+            out["Ep"],
+            marker="s",
+            linestyle="--",
+            label=rf"$E[p]$, {z_label}",
+        )
+
+    plt.xlabel("Maturity")
+    plt.ylabel("Price")
+    plt.title(
+        rf"Futures vs expected spot, fixed "
+        rf"$s={model.s_grid[i_s]:.3f}$, "
+        rf"$q={model.q_grid[i_q]:.3f}$"
+    )
+    plt.legend(frameon=False, ncol=2)
+    savefig(filename)
+
+
+def plot_futures_wedge_curve(
+    model, i_s, i_q, i_z, T=12,
+    filename="futures_wedge_curve.png"
+):
+    """
+    One state: wedge F - E[p].
+    """
+    out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
+
+    plt.figure(figsize=(8, 5))
+    plt.axhline(0.0, linewidth=1, linestyle="--")
+    plt.plot(out["maturity"], out["wedge"], marker="o")
+
+    plt.xlabel("Maturity")
+    plt.ylabel(r"$F_{t,t+h} - E_t[p_{t+h}]$")
+    plt.title(
+        rf"Futures wedge: "
+        rf"$s={model.s_grid[i_s]:.3f}$, "
+        rf"$q={model.q_grid[i_q]:.3f}$, "
+        rf"$z={model.z_grid[i_z]:.3f}$"
+    )
+    savefig(filename)
+
+
+def plot_futures_surface_fixed_z(
+    model, i_z, T=5, object_name="wedge",
+    filename="futures_wedge_fixed_z.png"
+):
+    """
+    Dense futures heatmap over (s,q), holding z fixed.
+    """
+    X = model.futures_surface_fixed_z(i_z=i_z, T=T, object_name=object_name)
+
+    plt.figure(figsize=(8, 5))
+    plt.imshow(
+        X.T,
+        origin="lower",
+        aspect="auto",
+        extent=[
+            model.s_grid[0],
+            model.s_grid[-1],
+            model.q_grid[0],
+            model.q_grid[-1],
+        ],
+    )
+    plt.xlabel(r"$s$")
+    plt.ylabel(r"$q$")
+    plt.title(rf"{object_name}, maturity {T}, fixed $z={model.z_grid[i_z]:.3f}$")
+    plt.colorbar(label=object_name)
+    savefig(filename)
+
+
+def make_core_plots(model, T=5):
+    """
+    Safe plotting bundle. No full futures grid is ever stored.
+
+    Includes:
+    - heatmaps for policy, price, convenience yield
+    - line charts for s', m, p, delta
+    - F vs expected spot charts
+    - futures wedge heatmaps
+    """
+    q_probs = (0.10, 0.50, 0.90)
+    z_probs = (0.10, 0.50, 0.90)
+    s_probs = (0.10, 0.50)
+
+    q_ids = quantile_indices(model.q_grid, q_probs)
+    z_ids = quantile_indices(model.z_grid, z_probs)
+    s_ids = quantile_indices(model.s_grid, s_probs)
+
+    binding = (model.s_policy <= 1e-8).astype(float)
+
+    # --------------------------------------------------------
+    # heatmaps and fixed-z line plots
+    # --------------------------------------------------------
+    for i_z in z_ids:
+        plot_heatmap_s_q_fixed_z(
+            model, binding, i_z,
+            label="binding",
+            title=r"Binding region: $s'(s,q,z)=0$",
+            filename=f"binding_fixed_z_{i_z}.png",
+        )
+
+        plot_heatmap_s_q_fixed_z(
+            model, model.s_policy, i_z,
+            label=r"$s'$",
+            title=r"Storage policy $s'(s,q,z)$",
+            filename=f"s_policy_fixed_z_{i_z}.png",
+        )
+
+        plot_heatmap_s_q_fixed_z(
+            model, model.m_policy, i_z,
+            label=r"$m$",
+            title=r"Commodity use $m(s,q,z)$",
+            filename=f"m_policy_fixed_z_{i_z}.png",
+        )
+
+        plot_heatmap_s_q_fixed_z(
+            model, model.price_s, i_z,
+            label=r"$p$",
+            title=r"Spot price $p(s,q,z)$",
+            filename=f"spot_price_fixed_z_{i_z}.png",
+        )
+
+        plot_heatmap_s_q_fixed_z(
+            model, model.convenience_yield, i_z,
+            label=r"$\delta$",
+            title=r"Convenience yield $\delta(s,q,z)$",
+            filename=f"convenience_yield_fixed_z_{i_z}.png",
+        )
+
+        plot_lines_vary_q_fixed_z(
+            model, model.s_policy, i_z,
+            ylabel=r"$s'(s,q,z)$",
+            title="Storage policy",
+            filename=f"s_policy_lines_vary_q_fixed_z_{i_z}.png",
+            q_probs=q_probs,
+        )
+
+        plot_lines_vary_q_fixed_z(
+            model, model.m_policy, i_z,
+            ylabel=r"$m(s,q,z)$",
+            title="Commodity use",
+            filename=f"m_policy_lines_vary_q_fixed_z_{i_z}.png",
+            q_probs=q_probs,
+        )
+
+        plot_lines_vary_q_fixed_z(
+            model, model.price_s, i_z,
+            ylabel=r"$p(s,q,z)$",
+            title="Spot price",
+            filename=f"spot_price_lines_vary_q_fixed_z_{i_z}.png",
+            q_probs=q_probs,
+        )
+
+        plot_lines_vary_q_fixed_z(
+            model, model.convenience_yield, i_z,
+            ylabel=r"$\delta(s,q,z)$",
+            title="Convenience yield",
+            filename=f"convenience_yield_lines_vary_q_fixed_z_{i_z}.png",
+            q_probs=q_probs,
+        )
+
+        # Dense 2D futures heatmaps over (s,q), fixed z.
+        plot_futures_surface_fixed_z(
+            model, i_z=i_z, T=T, object_name="F",
+            filename=f"futures_price_h{T}_fixed_z_{i_z}.png",
+        )
+
+        plot_futures_surface_fixed_z(
+            model, i_z=i_z, T=T, object_name="Ep",
+            filename=f"expected_spot_h{T}_fixed_z_{i_z}.png",
+        )
+
+        plot_futures_surface_fixed_z(
+            model, i_z=i_z, T=T, object_name="wedge",
+            filename=f"futures_wedge_h{T}_fixed_z_{i_z}.png",
+        )
+
+    # --------------------------------------------------------
+    # fixed-q line plots
+    # --------------------------------------------------------
+    for i_q in q_ids:
+        plot_lines_vary_z_fixed_q(
+            model, model.s_policy, i_q,
+            ylabel=r"$s'(s,q,z)$",
+            title="Storage policy",
+            filename=f"s_policy_lines_vary_z_fixed_q_{i_q}.png",
+            z_probs=z_probs,
+        )
+
+        plot_lines_vary_z_fixed_q(
+            model, model.m_policy, i_q,
+            ylabel=r"$m(s,q,z)$",
+            title="Commodity use",
+            filename=f"m_policy_lines_vary_z_fixed_q_{i_q}.png",
+            z_probs=z_probs,
+        )
+
+        plot_lines_vary_z_fixed_q(
+            model, model.price_s, i_q,
+            ylabel=r"$p(s,q,z)$",
+            title="Spot price",
+            filename=f"spot_price_lines_vary_z_fixed_q_{i_q}.png",
+            z_probs=z_probs,
+        )
+
+        plot_lines_vary_z_fixed_q(
+            model, model.convenience_yield, i_q,
+            ylabel=r"$\delta(s,q,z)$",
+            title="Convenience yield",
+            filename=f"convenience_yield_lines_vary_z_fixed_q_{i_q}.png",
+            z_probs=z_probs,
+        )
+
+    # --------------------------------------------------------
+    # futures curves: F and expected spot on same chart
+    # --------------------------------------------------------
+    for i_s in s_ids:
+        for i_z in z_ids:
+            plot_futures_F_vs_Ep_vary_q_fixed_sz(
+                model,
+                i_s=i_s,
+                i_z=i_z,
+                T=T,
+                filename=f"F_vs_Ep_vary_q_fixed_s_{i_s}_z_{i_z}.png",
+                q_probs=q_probs,
+            )
+
+        for i_q in q_ids:
+            plot_futures_F_vs_Ep_vary_z_fixed_sq(
+                model,
+                i_s=i_s,
+                i_q=i_q,
+                T=T,
+                filename=f"F_vs_Ep_vary_z_fixed_s_{i_s}_q_{i_q}.png",
+                z_probs=z_probs,
+            )
+
+            # A single-state pair: F/Ep and wedge.
+            for i_z in z_ids:
+                plot_futures_curve_F_vs_Ep(
+                    model,
+                    i_s=i_s,
+                    i_q=i_q,
+                    i_z=i_z,
+                    T=T,
+                    filename=f"F_vs_Ep_curve_s_{i_s}_q_{i_q}_z_{i_z}.png",
+                )
+
+                plot_futures_wedge_curve(
+                    model,
+                    i_s=i_s,
+                    i_q=i_q,
+                    i_z=i_z,
+                    T=T,
+                    filename=f"wedge_curve_s_{i_s}_q_{i_q}_z_{i_z}.png",
+                )
+
+
+# ============================================================
+# run
+# ============================================================
+
+if __name__ == "__main__":
+
+    model = CommodityModel(
+        crra=10.0,
+        beta=0.95,
+        alpha=0.5,
+        n_storage_states=500,
+        inflow_mean=0.1,
+        inflow_rho=0.90,
+        inflow_sigma=0.10,
+        n_inflow_states=100,
+        productivity_mean=1.0,
+        productivity_rho=0.95,
+        productivity_sigma=0.05,
+        n_productivity_states=100,
+        seed=123,
+    )
+
+    # First Numba call includes compile time.
+    # Second run will be much faster.
+    with timer("EGM solve"):
+        model.solve_egm(tol=1e-6, max_iter=500, verbose=True)
+
+    with timer("Map to decentralised"):
+        model.map_to_decentralised()
+
+    i_s = quantile_indices(model.s_grid, (0.50,))[0]
+    i_q = quantile_indices(model.q_grid, (0.50,))[0]
+    i_z = quantile_indices(model.z_grid, (0.50,))[0]
+
+    with timer("One futures curve"):
+        curve = model.futures_curve_at_index(i_s, i_q, i_z, T=12)
+        print(curve)
+
+    with timer("One F vs expected spot chart"):
+        plot_futures_curve_F_vs_Ep(
+            model,
+            i_s=i_s,
+            i_q=i_q,
+            i_z=i_z,
+            T=12,
+            filename="F_vs_Ep_one_state.png",
+        )
+
+    with timer("One fixed-z futures wedge heatmap"):
+        plot_futures_surface_fixed_z(
+            model,
+            i_z=i_z,
+            T=5,
+            object_name="wedge",
+            filename="futures_wedge_fixed_z.png",
+        )
+
+    with timer("Core plots"):
+        make_core_plots(model, T=5)
+
+    print("Done. Figures saved in ./figures")
