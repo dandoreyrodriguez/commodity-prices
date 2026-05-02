@@ -4,10 +4,11 @@
 # Fast Numba version: no 5D arrays, no full futures  #
 ######################################################
 
+
+# %%
 import time
 from contextlib import contextmanager
 from pathlib import Path
-
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
@@ -18,6 +19,7 @@ from numba import njit, prange
 # utilities
 # ============================================================
 
+# %%
 @contextmanager
 def timer(name):
     start = time.perf_counter()
@@ -475,6 +477,17 @@ def _futures_surface_fixed_s_at_horizon(
     return F_2d, Ep_2d, wedge_2d
 
 
+def _select_object(F, Ep, W, object_name):
+    if object_name == "F":
+        return F
+    elif object_name == "Ep":
+        return Ep
+    elif object_name == "wedge":
+        return W
+    else:
+        raise ValueError("object_name must be 'F', 'Ep', or 'wedge'")
+
+
 # ============================================================
 # model
 # ============================================================
@@ -711,475 +724,104 @@ class CommodityModel:
 # ============================================================
 # plotting helpers
 # ============================================================
-
-def _select_object(F, Ep, W, object_name):
-    if object_name == "F":
-        return F
-    if object_name == "Ep":
-        return Ep
-    if object_name == "wedge":
-        return W
-    raise ValueError("object_name must be 'F', 'Ep', or 'wedge'")
-
+# %% 
+def savefig(filename, folder="figures"):
+    Path(folder).mkdir(exist_ok=True)   # create folder if it doesn’t exist
+    plt.tight_layout()
+    plt.savefig(Path(folder) / filename, dpi=300, bbox_inches="tight")
+    plt.close()
 
 def nearest_index(grid, value):
     return int(np.argmin(np.abs(grid - value)))
 
 
-def quantile_indices(grid, probs):
-    return [nearest_index(grid, np.quantile(grid, p)) for p in probs]
-
-
-def savefig(filename, fig_dir="figures"):
-    Path(fig_dir).mkdir(exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(Path(fig_dir) / filename, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def plot_heatmap_s_q_fixed_z(model, X, i_z, label, title, filename):
-    """
-    Plot any 3D object X(s,q,z) as an s-q heatmap holding z fixed.
-    """
-    plt.figure(figsize=(8, 5))
-    plt.imshow(
-        X[:, :, i_z].T,
-        origin="lower",
-        aspect="auto",
-        extent=[
-            model.s_grid[0],
-            model.s_grid[-1],
-            model.q_grid[0],
-            model.q_grid[-1],
-        ],
-    )
-    plt.xlabel(r"$s$")
-    plt.ylabel(r"$q$")
-    plt.title(title + rf", fixed $z={model.z_grid[i_z]:.3f}$")
-    plt.colorbar(label=label)
-    savefig(filename)
-
-
-def plot_lines_vary_q_fixed_z(
-    model, X, i_z, ylabel, title, filename,
-    q_probs=(0.10, 0.50, 0.90)
+def plot_storage_diagnostics(
+    model,
+    i_z=None,
+    q_probs=(0.01, 0.20, 0.60),
+    binding_tol=1e-8,
+    s_zoom=0.006,
+    filename="storage_diagnostics_zoom.png",
 ):
-    """
-    Line plot against s. Hold z fixed. Vary q.
-    """
-    plt.figure(figsize=(8, 5))
+    if i_z is None:
+        i_z = nearest_index(model.z_grid, np.median(model.z_grid))
 
-    for i_q in quantile_indices(model.q_grid, q_probs):
-        plt.plot(
+    z_val = model.z_grid[i_z]
+
+    binding = (model.s_policy[:, :, i_z] <= binding_tol).astype(float)
+    delta = model.convenience_yield[:, :, i_z]
+
+    S, Q = np.meshgrid(model.s_grid, model.q_grid, indexing="ij")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # 1. Binding region
+    axes[0].pcolormesh(
+        S,
+        Q,
+        binding,
+        shading="auto",
+        vmin=0,
+        vmax=1,
+    )
+    axes[0].set_title(r"Binding region: $s'(s,q,z)=0$")
+    axes[0].set_xlabel(r"storage today, $s$")
+    axes[0].set_ylabel(r"inflow, $q$")
+    axes[0].set_xlim(0.0, s_zoom)
+
+    # 2. Convenience yield
+    im1 = axes[1].pcolormesh(
+        S,
+        Q,
+        delta,
+        shading="auto",
+    )
+    axes[1].set_title(r"Convenience yield $\delta(s,q,z)$")
+    axes[1].set_xlabel(r"storage today, $s$")
+    axes[1].set_ylabel(r"inflow, $q$")
+    axes[1].set_xlim(0.0, s_zoom)
+    fig.colorbar(im1, ax=axes[1], label=r"$\delta$")
+
+    # 3. Storage policy lines
+    for prob in q_probs:
+        q_val = np.quantile(model.q_grid, prob)
+        i_q = nearest_index(model.q_grid, q_val)
+        sp = model.s_policy[:, i_q, i_z]
+        axes[2].plot(
             model.s_grid,
-            X[:, i_q, i_z],
-            label=rf"$q={model.q_grid[i_q]:.3f}$",
+            sp,
+            label=rf"$q={model.q_grid[i_q]:.4f}$",
         )
 
-    plt.xlabel(r"$s$")
-    plt.ylabel(ylabel)
-    plt.title(title + rf", fixed $z={model.z_grid[i_z]:.3f}$")
-    plt.legend(frameon=False)
+    axes[2].set_title(r"Storage policy, $s'(s,q,z)$")
+    axes[2].set_xlabel(r"storage today, $s$")
+    axes[2].set_ylabel(r"storage tomorrow, $s'$")
+    axes[2].set_xlim(0.0, s_zoom)
+    axes[2].set_ylim(-0.0005, s_zoom)
+    axes[2].legend(frameon=False)
+
+    fig.suptitle(rf"Storage diagnostics at fixed $z={z_val:.3f}$", y=1.03)
+
     savefig(filename)
-
-
-def plot_lines_vary_z_fixed_q(
-    model, X, i_q, ylabel, title, filename,
-    z_probs=(0.10, 0.50, 0.90)
-):
-    """
-    Line plot against s. Hold q fixed. Vary z.
-    """
-    plt.figure(figsize=(8, 5))
-
-    for i_z in quantile_indices(model.z_grid, z_probs):
-        plt.plot(
-            model.s_grid,
-            X[:, i_q, i_z],
-            label=rf"$z={model.z_grid[i_z]:.3f}$",
-        )
-
-    plt.xlabel(r"$s$")
-    plt.ylabel(ylabel)
-    plt.title(title + rf", fixed $q={model.q_grid[i_q]:.3f}$")
-    plt.legend(frameon=False)
-    savefig(filename)
-
-
-# ------------------------------------------------------------
-# Futures plotting: F and expected spot on same chart
-# ------------------------------------------------------------
-
-def plot_futures_curve_F_vs_Ep(
-    model, i_s, i_q, i_z, T=12,
-    filename="futures_F_vs_Ep_curve.png"
-):
-    """
-    One state: plot futures price and expected future spot on same chart.
-    """
-    out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(out["maturity"], out["F"], marker="o", label=r"$F_{t,t+h}$")
-    plt.plot(out["maturity"], out["Ep"], marker="s", label=r"$E_t[p_{t+h}]$")
-    plt.axhline(
-        model.price_s[i_s, i_q, i_z],
-        linewidth=1,
-        linestyle="--",
-        label=r"$p_t$",
-    )
-
-    plt.xlabel("Maturity")
-    plt.ylabel("Price")
-    plt.title(
-        rf"Futures vs expected spot: "
-        rf"$s={model.s_grid[i_s]:.3f}$, "
-        rf"$q={model.q_grid[i_q]:.3f}$, "
-        rf"$z={model.z_grid[i_z]:.3f}$"
-    )
-    plt.legend(frameon=False)
-    savefig(filename)
-
-
-def plot_futures_F_vs_Ep_vary_q_fixed_sz(
-    model, i_s, i_z, T=12,
-    filename="futures_F_vs_Ep_vary_q_fixed_sz.png",
-    q_probs=(0.10, 0.50, 0.90)
-):
-    """
-    Multiple states: hold s,z fixed, vary q.
-    Each q gets two lines: F solid-marker-o, Ep dashed-marker-s.
-    """
-    plt.figure(figsize=(9, 5.5))
-    maturities = np.arange(T + 1)
-
-    for i_q in quantile_indices(model.q_grid, q_probs):
-        out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
-        q_label = rf"$q={model.q_grid[i_q]:.3f}$"
-
-        plt.plot(
-            maturities,
-            out["F"],
-            marker="o",
-            label=rf"$F$, {q_label}",
-        )
-        plt.plot(
-            maturities,
-            out["Ep"],
-            marker="s",
-            linestyle="--",
-            label=rf"$E[p]$, {q_label}",
-        )
-
-    plt.xlabel("Maturity")
-    plt.ylabel("Price")
-    plt.title(
-        rf"Futures vs expected spot, fixed "
-        rf"$s={model.s_grid[i_s]:.3f}$, "
-        rf"$z={model.z_grid[i_z]:.3f}$"
-    )
-    plt.legend(frameon=False, ncol=2)
-    savefig(filename)
-
-
-def plot_futures_F_vs_Ep_vary_z_fixed_sq(
-    model, i_s, i_q, T=12,
-    filename="futures_F_vs_Ep_vary_z_fixed_sq.png",
-    z_probs=(0.10, 0.50, 0.90)
-):
-    """
-    Multiple states: hold s,q fixed, vary z.
-    Each z gets two lines: F solid-marker-o, Ep dashed-marker-s.
-    """
-    plt.figure(figsize=(9, 5.5))
-    maturities = np.arange(T + 1)
-
-    for i_z in quantile_indices(model.z_grid, z_probs):
-        out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
-        z_label = rf"$z={model.z_grid[i_z]:.3f}$"
-
-        plt.plot(
-            maturities,
-            out["F"],
-            marker="o",
-            label=rf"$F$, {z_label}",
-        )
-        plt.plot(
-            maturities,
-            out["Ep"],
-            marker="s",
-            linestyle="--",
-            label=rf"$E[p]$, {z_label}",
-        )
-
-    plt.xlabel("Maturity")
-    plt.ylabel("Price")
-    plt.title(
-        rf"Futures vs expected spot, fixed "
-        rf"$s={model.s_grid[i_s]:.3f}$, "
-        rf"$q={model.q_grid[i_q]:.3f}$"
-    )
-    plt.legend(frameon=False, ncol=2)
-    savefig(filename)
-
-
-def plot_futures_wedge_curve(
-    model, i_s, i_q, i_z, T=12,
-    filename="futures_wedge_curve.png"
-):
-    """
-    One state: wedge F - E[p].
-    """
-    out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
-
-    plt.figure(figsize=(8, 5))
-    plt.axhline(0.0, linewidth=1, linestyle="--")
-    plt.plot(out["maturity"], out["wedge"], marker="o")
-
-    plt.xlabel("Maturity")
-    plt.ylabel(r"$F_{t,t+h} - E_t[p_{t+h}]$")
-    plt.title(
-        rf"Futures wedge: "
-        rf"$s={model.s_grid[i_s]:.3f}$, "
-        rf"$q={model.q_grid[i_q]:.3f}$, "
-        rf"$z={model.z_grid[i_z]:.3f}$"
-    )
-    savefig(filename)
-
-
-def plot_futures_surface_fixed_z(
-    model, i_z, T=5, object_name="wedge",
-    filename="futures_wedge_fixed_z.png"
-):
-    """
-    Dense futures heatmap over (s,q), holding z fixed.
-    """
-    X = model.futures_surface_fixed_z(i_z=i_z, T=T, object_name=object_name)
-
-    plt.figure(figsize=(8, 5))
-    plt.imshow(
-        X.T,
-        origin="lower",
-        aspect="auto",
-        extent=[
-            model.s_grid[0],
-            model.s_grid[-1],
-            model.q_grid[0],
-            model.q_grid[-1],
-        ],
-    )
-    plt.xlabel(r"$s$")
-    plt.ylabel(r"$q$")
-    plt.title(rf"{object_name}, maturity {T}, fixed $z={model.z_grid[i_z]:.3f}$")
-    plt.colorbar(label=object_name)
-    savefig(filename)
-
-
-def make_core_plots(model, T=5):
-    """
-    Safe plotting bundle. No full futures grid is ever stored.
-
-    Includes:
-    - heatmaps for policy, price, convenience yield
-    - line charts for s', m, p, delta
-    - F vs expected spot charts
-    - futures wedge heatmaps
-    """
-    q_probs = (0.10, 0.50, 0.90)
-    z_probs = (0.10, 0.50, 0.90)
-    s_probs = (0.10, 0.50)
-
-    q_ids = quantile_indices(model.q_grid, q_probs)
-    z_ids = quantile_indices(model.z_grid, z_probs)
-    s_ids = quantile_indices(model.s_grid, s_probs)
-
-    binding = (model.s_policy <= 1e-8).astype(float)
-
-    # --------------------------------------------------------
-    # heatmaps and fixed-z line plots
-    # --------------------------------------------------------
-    for i_z in z_ids:
-        plot_heatmap_s_q_fixed_z(
-            model, binding, i_z,
-            label="binding",
-            title=r"Binding region: $s'(s,q,z)=0$",
-            filename=f"binding_fixed_z_{i_z}.png",
-        )
-
-        plot_heatmap_s_q_fixed_z(
-            model, model.s_policy, i_z,
-            label=r"$s'$",
-            title=r"Storage policy $s'(s,q,z)$",
-            filename=f"s_policy_fixed_z_{i_z}.png",
-        )
-
-        plot_heatmap_s_q_fixed_z(
-            model, model.m_policy, i_z,
-            label=r"$m$",
-            title=r"Commodity use $m(s,q,z)$",
-            filename=f"m_policy_fixed_z_{i_z}.png",
-        )
-
-        plot_heatmap_s_q_fixed_z(
-            model, model.price_s, i_z,
-            label=r"$p$",
-            title=r"Spot price $p(s,q,z)$",
-            filename=f"spot_price_fixed_z_{i_z}.png",
-        )
-
-        plot_heatmap_s_q_fixed_z(
-            model, model.convenience_yield, i_z,
-            label=r"$\delta$",
-            title=r"Convenience yield $\delta(s,q,z)$",
-            filename=f"convenience_yield_fixed_z_{i_z}.png",
-        )
-
-        plot_lines_vary_q_fixed_z(
-            model, model.s_policy, i_z,
-            ylabel=r"$s'(s,q,z)$",
-            title="Storage policy",
-            filename=f"s_policy_lines_vary_q_fixed_z_{i_z}.png",
-            q_probs=q_probs,
-        )
-
-        plot_lines_vary_q_fixed_z(
-            model, model.m_policy, i_z,
-            ylabel=r"$m(s,q,z)$",
-            title="Commodity use",
-            filename=f"m_policy_lines_vary_q_fixed_z_{i_z}.png",
-            q_probs=q_probs,
-        )
-
-        plot_lines_vary_q_fixed_z(
-            model, model.price_s, i_z,
-            ylabel=r"$p(s,q,z)$",
-            title="Spot price",
-            filename=f"spot_price_lines_vary_q_fixed_z_{i_z}.png",
-            q_probs=q_probs,
-        )
-
-        plot_lines_vary_q_fixed_z(
-            model, model.convenience_yield, i_z,
-            ylabel=r"$\delta(s,q,z)$",
-            title="Convenience yield",
-            filename=f"convenience_yield_lines_vary_q_fixed_z_{i_z}.png",
-            q_probs=q_probs,
-        )
-
-        # Dense 2D futures heatmaps over (s,q), fixed z.
-        plot_futures_surface_fixed_z(
-            model, i_z=i_z, T=T, object_name="F",
-            filename=f"futures_price_h{T}_fixed_z_{i_z}.png",
-        )
-
-        plot_futures_surface_fixed_z(
-            model, i_z=i_z, T=T, object_name="Ep",
-            filename=f"expected_spot_h{T}_fixed_z_{i_z}.png",
-        )
-
-        plot_futures_surface_fixed_z(
-            model, i_z=i_z, T=T, object_name="wedge",
-            filename=f"futures_wedge_h{T}_fixed_z_{i_z}.png",
-        )
-
-    # --------------------------------------------------------
-    # fixed-q line plots
-    # --------------------------------------------------------
-    for i_q in q_ids:
-        plot_lines_vary_z_fixed_q(
-            model, model.s_policy, i_q,
-            ylabel=r"$s'(s,q,z)$",
-            title="Storage policy",
-            filename=f"s_policy_lines_vary_z_fixed_q_{i_q}.png",
-            z_probs=z_probs,
-        )
-
-        plot_lines_vary_z_fixed_q(
-            model, model.m_policy, i_q,
-            ylabel=r"$m(s,q,z)$",
-            title="Commodity use",
-            filename=f"m_policy_lines_vary_z_fixed_q_{i_q}.png",
-            z_probs=z_probs,
-        )
-
-        plot_lines_vary_z_fixed_q(
-            model, model.price_s, i_q,
-            ylabel=r"$p(s,q,z)$",
-            title="Spot price",
-            filename=f"spot_price_lines_vary_z_fixed_q_{i_q}.png",
-            z_probs=z_probs,
-        )
-
-        plot_lines_vary_z_fixed_q(
-            model, model.convenience_yield, i_q,
-            ylabel=r"$\delta(s,q,z)$",
-            title="Convenience yield",
-            filename=f"convenience_yield_lines_vary_z_fixed_q_{i_q}.png",
-            z_probs=z_probs,
-        )
-
-    # --------------------------------------------------------
-    # futures curves: F and expected spot on same chart
-    # --------------------------------------------------------
-    for i_s in s_ids:
-        for i_z in z_ids:
-            plot_futures_F_vs_Ep_vary_q_fixed_sz(
-                model,
-                i_s=i_s,
-                i_z=i_z,
-                T=T,
-                filename=f"F_vs_Ep_vary_q_fixed_s_{i_s}_z_{i_z}.png",
-                q_probs=q_probs,
-            )
-
-        for i_q in q_ids:
-            plot_futures_F_vs_Ep_vary_z_fixed_sq(
-                model,
-                i_s=i_s,
-                i_q=i_q,
-                T=T,
-                filename=f"F_vs_Ep_vary_z_fixed_s_{i_s}_q_{i_q}.png",
-                z_probs=z_probs,
-            )
-
-            # A single-state pair: F/Ep and wedge.
-            for i_z in z_ids:
-                plot_futures_curve_F_vs_Ep(
-                    model,
-                    i_s=i_s,
-                    i_q=i_q,
-                    i_z=i_z,
-                    T=T,
-                    filename=f"F_vs_Ep_curve_s_{i_s}_q_{i_q}_z_{i_z}.png",
-                )
-
-                plot_futures_wedge_curve(
-                    model,
-                    i_s=i_s,
-                    i_q=i_q,
-                    i_z=i_z,
-                    T=T,
-                    filename=f"wedge_curve_s_{i_s}_q_{i_q}_z_{i_z}.png",
-                )
-
 
 # ============================================================
 # run
 # ============================================================
+#%%
 
 if __name__ == "__main__":
 
     model = CommodityModel(
-        crra=10.0,
+        crra=5.0,
         beta=0.95,
         alpha=0.5,
         n_storage_states=500,
         inflow_mean=0.1,
-        inflow_rho=0.90,
-        inflow_sigma=0.10,
+        inflow_rho=0.85,
+        inflow_sigma=0.04,
         n_inflow_states=100,
         productivity_mean=1.0,
-        productivity_rho=0.95,
+        productivity_rho=0.90,
         productivity_sigma=0.05,
         n_productivity_states=100,
         seed=123,
@@ -1193,34 +835,8 @@ if __name__ == "__main__":
     with timer("Map to decentralised"):
         model.map_to_decentralised()
 
-    i_s = quantile_indices(model.s_grid, (0.50,))[0]
-    i_q = quantile_indices(model.q_grid, (0.50,))[0]
-    i_z = quantile_indices(model.z_grid, (0.50,))[0]
+# %%
 
-    with timer("One futures curve"):
-        curve = model.futures_curve_at_index(i_s, i_q, i_z, T=12)
-        print(curve)
-
-    with timer("One F vs expected spot chart"):
-        plot_futures_curve_F_vs_Ep(
-            model,
-            i_s=i_s,
-            i_q=i_q,
-            i_z=i_z,
-            T=12,
-            filename="F_vs_Ep_one_state.png",
-        )
-
-    with timer("One fixed-z futures wedge heatmap"):
-        plot_futures_surface_fixed_z(
-            model,
-            i_z=i_z,
-            T=5,
-            object_name="wedge",
-            filename="futures_wedge_fixed_z.png",
-        )
-
-    with timer("Core plots"):
-        make_core_plots(model, T=5)
-
-    print("Done. Figures saved in ./figures")
+# Plots ---------------
+plot_storage_diagnostics(model, s_zoom=0.03)
+# %%
