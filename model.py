@@ -501,7 +501,7 @@ class CommodityModel:
         n_storage_states=100,
         storage_max_multiple=4.0,
         storage_curvature=3.0,
-        inflow_mean=0.1,
+        inflow_min=0.002,
         inflow_rho=0.9,
         inflow_sigma=0.1,
         n_inflow_states=20,
@@ -525,8 +525,8 @@ class CommodityModel:
             m=2.0,
             seed=seed_q,
         )
-        self.inflow_mean = float(inflow_mean)
-        self.q_grid = np.ascontiguousarray(self.inflow_mean * np.exp(self.inflow_process.grid))
+        self.inflow_min = float(inflow_min)
+        self.q_grid = self.inflow_min + np.ascontiguousarray(np.exp(self.inflow_process.grid))
         self.P_q = np.ascontiguousarray(self.inflow_process.P)
         self.stationary_dist_q = self.inflow_process.stationary_dist
         self.n_q = int(n_inflow_states)
@@ -548,7 +548,7 @@ class CommodityModel:
         self.storage_max_multiple = float(storage_max_multiple)
         self.storage_curvature = float(storage_curvature)
 
-        s_max = self.storage_max_multiple * self.inflow_mean
+        s_max = self.storage_max_multiple * float(self.q_grid @ self.stationary_dist_q)
         self.s_grid = np.ascontiguousarray(self.make_storage_grid(s_max, self.n_s, self.storage_curvature))
 
         shape = (self.n_s, self.n_q, self.n_z)
@@ -720,123 +720,578 @@ class CommodityModel:
         )
         return _select_object(F, Ep, W, object_name)
 
+# ============================================================
+# run model
+# ============================================================
 
-# ============================================================
-# plotting helpers
-# ============================================================
+if __name__ == "__main__":
+
+    model = CommodityModel(
+        crra=10.0,
+        beta=0.95,
+        alpha=0.5,
+        n_storage_states=500,
+        inflow_min=0.01,
+        inflow_rho=0.80,
+        inflow_sigma=0.2,
+        n_inflow_states=150,
+        productivity_mean=1.0,
+        productivity_rho=0.90,
+        productivity_sigma=0.10,
+        n_productivity_states=150,
+        seed=123,
+    )
+
+    with timer("EGM solve"):
+        model.solve_egm(
+            tol=1e-6,
+            max_iter=500,
+            verbose=True,
+        )
+
+    with timer("Map to decentralised"):
+        model.map_to_decentralised()
+
+    print("Model solved and mapped.")
+
+
 # %% 
-def savefig(filename, folder="figures"):
-    Path(folder).mkdir(exist_ok=True)   # create folder if it doesn’t exist
-    plt.tight_layout()
-    plt.savefig(Path(folder) / filename, dpi=300, bbox_inches="tight")
-    plt.close()
+# ============================================================
+# plotting + diagnostics: return figures, do not auto-close
+# ============================================================
+
 
 def nearest_index(grid, value):
     return int(np.argmin(np.abs(grid - value)))
 
 
-def plot_storage_diagnostics(
+def quantile_indices(grid, probs):
+    return [nearest_index(grid, np.quantile(grid, p)) for p in probs]
+
+
+def save_fig(fig, filename, folder="figures", tight=True):
+    Path(folder).mkdir(exist_ok=True)
+
+    if tight:
+        fig.tight_layout()
+
+    fig.savefig(Path(folder) / filename, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_and_save(fig_func, filename, *args, tight=True, **kwargs):
+    """
+    Create figure → save → close immediately.
+    Use tight=False for figures using constrained_layout=True.
+    """
+    out = fig_func(*args, **kwargs)
+    fig = out[0] if isinstance(out, tuple) else out
+    save_fig(fig, filename, tight=tight)
+
+def visible_ylim(model, X, q_ids=None, z_ids=None, s_zoom=None, pad=0.06):
+    """
+    Compute y-limits using only the part of the curves visible under s_zoom.
+    Works for shared-y panel plots.
+    """
+    s_mask = model.s_grid <= s_zoom if s_zoom is not None else np.ones_like(model.s_grid, dtype=bool)
+
+    vals = []
+
+    if q_ids is not None and z_ids is not None:
+        for i_q in q_ids:
+            for i_z in z_ids:
+                vals.append(X[s_mask, i_q, i_z])
+
+    vals = np.concatenate(vals)
+
+    ymin = np.nanmin(vals)
+    ymax = np.nanmax(vals)
+
+    gap = pad * (ymax - ymin if ymax > ymin else 1.0)
+
+    return max(0.0, ymin - gap), ymax + gap
+
+def consumption(model):
+    return model.z_grid[None, None, :] * model.m_policy ** model.alpha
+
+
+def binding_region(model, tol=1e-8):
+    return (model.s_policy <= tol).astype(float)
+
+
+# ============================================================
+# LINE PANELS
+# ============================================================
+
+def lines_vary_q_across_z(
     model,
-    i_z=None,
-    q_probs=(0.01, 0.20, 0.60),
-    binding_tol=1e-8,
-    s_zoom=0.006,
-    filename="storage_diagnostics_zoom.png",
+    X,
+    q_probs=(0.05, 0.50, 0.80),
+    z_probs=(0.05, 0.50, 0.80),
+    title="",
+    ylabel="",
+    s_zoom=None,
+    sharey=True,
 ):
-    if i_z is None:
-        i_z = nearest_index(model.z_grid, np.median(model.z_grid))
+    q_ids = quantile_indices(model.q_grid, q_probs)
+    z_ids = quantile_indices(model.z_grid, z_probs)
 
-    z_val = model.z_grid[i_z]
+    fig, axes = plt.subplots(
+        1,
+        len(z_ids),
+        figsize=(5 * len(z_ids), 4),
+        sharex=True,
+        sharey=sharey,
+    )
 
-    binding = (model.s_policy[:, :, i_z] <= binding_tol).astype(float)
-    delta = model.convenience_yield[:, :, i_z]
+    if len(z_ids) == 1:
+        axes = [axes]
+
+    ylo, yhi = visible_ylim(
+        model,
+        X,
+        q_ids=q_ids,
+        z_ids=z_ids,
+        s_zoom=s_zoom,
+    )
+
+    for ax, i_z, z_prob in zip(axes, z_ids, z_probs):
+        for i_q, q_prob in zip(q_ids, q_probs):
+            ax.plot(
+                model.s_grid,
+                X[:, i_q, i_z],
+                label=rf"$q_{{{q_prob:.2f}}}$",
+            )
+
+        ax.set_title(rf"$z_{{{z_prob:.2f}}}$")
+        ax.set_xlabel(r"$s$")
+
+        if s_zoom is not None:
+            ax.set_xlim(0.0, s_zoom)
+
+        ax.set_ylim(ylo, yhi)
+        ax.legend(frameon=False, fontsize=8)
+
+    axes[0].set_ylabel(ylabel)
+    fig.suptitle(title)
+    fig.subplots_adjust(top=0.82)
+
+    return fig, axes
+def lines_vary_z_across_q(
+    model,
+    X,
+    q_probs=(0.05, 0.50, 0.80),
+    z_probs=(0.05, 0.50, 0.80),
+    title="",
+    ylabel="",
+    s_zoom=None,
+    sharey=True,
+):
+    q_ids = quantile_indices(model.q_grid, q_probs)
+    z_ids = quantile_indices(model.z_grid, z_probs)
+
+    fig, axes = plt.subplots(
+        1,
+        len(q_ids),
+        figsize=(5 * len(q_ids), 4),
+        sharex=True,
+        sharey=sharey,
+    )
+
+    if len(q_ids) == 1:
+        axes = [axes]
+
+    ylo, yhi = visible_ylim(
+        model,
+        X,
+        q_ids=q_ids,
+        z_ids=z_ids,
+        s_zoom=s_zoom,
+    )
+
+    for ax, i_q, q_prob in zip(axes, q_ids, q_probs):
+        for i_z, z_prob in zip(z_ids, z_probs):
+            ax.plot(
+                model.s_grid,
+                X[:, i_q, i_z],
+                label=rf"$z_{{{z_prob:.2f}}}$",
+            )
+
+        ax.set_title(rf"$q_{{{q_prob:.2f}}}$")
+        ax.set_xlabel(r"$s$")
+
+        if s_zoom is not None:
+            ax.set_xlim(0.0, s_zoom)
+
+        ax.set_ylim(ylo, yhi)
+        ax.legend(frameon=False, fontsize=8)
+
+    axes[0].set_ylabel(ylabel)
+    fig.suptitle(title)
+    fig.subplots_adjust(top=0.82)
+
+    return fig, axes
+
+# ============================================================
+# heatmaps with constrained_layout=True
+# ============================================================
+
+def heatmaps_s_q_across_z(
+    model,
+    X,
+    z_probs=(0.05, 0.50, 0.80),
+    title="",
+    label="",
+    s_zoom=None,
+    shared_scale=True,
+    cmap="viridis",
+):
+    z_ids = quantile_indices(model.z_grid, z_probs)
+
+    fig, axes = plt.subplots(
+        1,
+        len(z_ids),
+        figsize=(5 * len(z_ids), 4),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+
+    if len(z_ids) == 1:
+        axes = [axes]
 
     S, Q = np.meshgrid(model.s_grid, model.q_grid, indexing="ij")
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    # global scale if requested
+    if shared_scale:
+        vmin = np.min(X)
+        vmax = np.max(X)
+    else:
+        vmin = vmax = None
 
-    # 1. Binding region
-    axes[0].pcolormesh(
-        S,
-        Q,
-        binding,
-        shading="auto",
-        vmin=0,
-        vmax=1,
-    )
-    axes[0].set_title(r"Binding region: $s'(s,q,z)=0$")
-    axes[0].set_xlabel(r"storage today, $s$")
-    axes[0].set_ylabel(r"inflow, $q$")
-    axes[0].set_xlim(0.0, s_zoom)
+    ims = []
 
-    # 2. Convenience yield
-    im1 = axes[1].pcolormesh(
-        S,
-        Q,
-        delta,
-        shading="auto",
-    )
-    axes[1].set_title(r"Convenience yield $\delta(s,q,z)$")
-    axes[1].set_xlabel(r"storage today, $s$")
-    axes[1].set_ylabel(r"inflow, $q$")
-    axes[1].set_xlim(0.0, s_zoom)
-    fig.colorbar(im1, ax=axes[1], label=r"$\delta$")
-
-    # 3. Storage policy lines
-    for prob in q_probs:
-        q_val = np.quantile(model.q_grid, prob)
-        i_q = nearest_index(model.q_grid, q_val)
-        sp = model.s_policy[:, i_q, i_z]
-        axes[2].plot(
-            model.s_grid,
-            sp,
-            label=rf"$q={model.q_grid[i_q]:.4f}$",
+    for ax, i_z, z_prob in zip(axes, z_ids, z_probs):
+        im = ax.pcolormesh(
+            S,
+            Q,
+            X[:, :, i_z],
+            shading="auto",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
         )
+        ims.append(im)
 
-    axes[2].set_title(r"Storage policy, $s'(s,q,z)$")
-    axes[2].set_xlabel(r"storage today, $s$")
-    axes[2].set_ylabel(r"storage tomorrow, $s'$")
-    axes[2].set_xlim(0.0, s_zoom)
-    axes[2].set_ylim(-0.0005, s_zoom)
-    axes[2].legend(frameon=False)
+        ax.set_title(rf"$z_{{{z_prob:.2f}}}={model.z_grid[i_z]:.4f}$")
+        ax.set_xlabel(r"storage today, $s$")
 
-    fig.suptitle(rf"Storage diagnostics at fixed $z={z_val:.3f}$", y=1.03)
+        if s_zoom is not None:
+            ax.set_xlim(0.0, s_zoom)
 
-    savefig(filename)
+    axes[0].set_ylabel(r"inflow, $q$")
 
-# ============================================================
-# run
-# ============================================================
-#%%
+    # colorbars
+    if shared_scale:
+        cbar = fig.colorbar(ims[0], ax=axes, fraction=0.05, pad=0.04)
+        cbar.set_label(label)
+    else:
+        for ax, im in zip(axes, ims):
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label(label)
 
-if __name__ == "__main__":
+    fig.suptitle(title)
 
-    model = CommodityModel(
-        crra=5.0,
-        beta=0.95,
-        alpha=0.5,
-        n_storage_states=500,
-        inflow_mean=0.1,
-        inflow_rho=0.85,
-        inflow_sigma=0.04,
-        n_inflow_states=100,
-        productivity_mean=1.0,
-        productivity_rho=0.90,
-        productivity_sigma=0.05,
-        n_productivity_states=100,
-        seed=123,
+    return fig, axes
+
+def heatmaps_s_z_across_q(
+    model,
+    X,
+    q_probs=(0.05, 0.50, 0.80),
+    title="",
+    label="",
+    s_zoom=None,
+    shared_scale=True,
+    cmap="viridis",
+):
+    q_ids = quantile_indices(model.q_grid, q_probs)
+
+    fig, axes = plt.subplots(
+        1,
+        len(q_ids),
+        figsize=(5 * len(q_ids), 4),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
     )
 
-    # First Numba call includes compile time.
-    # Second run will be much faster.
-    with timer("EGM solve"):
-        model.solve_egm(tol=1e-6, max_iter=500, verbose=True)
+    if len(q_ids) == 1:
+        axes = [axes]
 
-    with timer("Map to decentralised"):
-        model.map_to_decentralised()
+    S, Z = np.meshgrid(model.s_grid, model.z_grid, indexing="ij")
 
-# %%
+    # global scale
+    if shared_scale:
+        vmin = np.min(X)
+        vmax = np.max(X)
+    else:
+        vmin = vmax = None
 
-# Plots ---------------
-plot_storage_diagnostics(model, s_zoom=0.03)
-# %%
+    ims = []
+
+    for ax, i_q, q_prob in zip(axes, q_ids, q_probs):
+        im = ax.pcolormesh(
+            S,
+            Z,
+            X[:, i_q, :],
+            shading="auto",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ims.append(im)
+
+        ax.set_title(rf"$q_{{{q_prob:.2f}}}={model.q_grid[i_q]:.4f}$")
+        ax.set_xlabel(r"storage today, $s$")
+
+        if s_zoom is not None:
+            ax.set_xlim(0.0, s_zoom)
+
+    axes[0].set_ylabel(r"productivity, $z$")
+
+    # colorbars
+    if shared_scale:
+        cbar = fig.colorbar(ims[0], ax=axes, fraction=0.05, pad=0.04)
+        cbar.set_label(label)
+    else:
+        for ax, im in zip(axes, ims):
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label(label)
+
+    fig.suptitle(title)
+
+    return fig, axes
+
+def futures_curves_vary_q_across_z(
+    model,
+    q_probs=(0.05, 0.50, 0.80),
+    z_probs=(0.05, 0.50, 0.80),
+    i_s=None,
+    T=12,
+):
+    if i_s is None:
+        i_s = nearest_index(model.s_grid, np.median(model.s_grid))
+
+    q_ids = quantile_indices(model.q_grid, q_probs)
+    z_ids = quantile_indices(model.z_grid, z_probs)
+
+    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(q_ids)))
+
+    fig, axes = plt.subplots(
+        1,
+        len(z_ids),
+        figsize=(5 * len(z_ids), 4),
+        sharey=True,
+    )
+
+    if len(z_ids) == 1:
+        axes = [axes]
+
+    stored = {}
+
+    for ax, i_z, z_prob in zip(axes, z_ids, z_probs):
+        stored[i_z] = {}
+
+        for color, i_q, q_prob in zip(colors, q_ids, q_probs):
+            out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
+            stored[i_z][i_q] = out
+
+            ax.plot(
+                out["maturity"],
+                out["F"],
+                color=color,
+                marker="o",
+                label=rf"$F$, $q_{{{q_prob:.2f}}}$",
+            )
+
+            ax.plot(
+                out["maturity"],
+                out["Ep"],
+                color=color,
+                linestyle="--",
+                marker="s",
+                label=rf"$E[p]$, $q_{{{q_prob:.2f}}}$",
+            )
+
+        ax.set_title(rf"$z_{{{z_prob:.2f}}}$")
+        ax.set_xlabel("maturity")
+        ax.legend(frameon=False, fontsize=8)
+
+    axes[0].set_ylabel("price")
+    fig.suptitle(
+        rf"Futures vs expected spot, fixed $s={model.s_grid[i_s]:.4f}$"
+    )
+    fig.subplots_adjust(top=0.82)
+
+    return fig, axes, stored
+
+def futures_curves_vary_z_across_q(
+    model,
+    q_probs=(0.05, 0.50, 0.80),
+    z_probs=(0.05, 0.50, 0.80),
+    i_s=None,
+    T=12,
+):
+    if i_s is None:
+        i_s = nearest_index(model.s_grid, np.median(model.s_grid))
+
+    q_ids = quantile_indices(model.q_grid, q_probs)
+    z_ids = quantile_indices(model.z_grid, z_probs)
+
+    colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(z_ids)))
+
+    fig, axes = plt.subplots(
+        1,
+        len(q_ids),
+        figsize=(5 * len(q_ids), 4),
+        sharey=True,
+    )
+
+    if len(q_ids) == 1:
+        axes = [axes]
+
+    stored = {}
+
+    for ax, i_q, q_prob in zip(axes, q_ids, q_probs):
+        stored[i_q] = {}
+
+        for color, i_z, z_prob in zip(colors, z_ids, z_probs):
+            out = model.futures_curve_at_index(i_s, i_q, i_z, T=T)
+            stored[i_q][i_z] = out
+
+            ax.plot(
+                out["maturity"],
+                out["F"],
+                color=color,
+                marker="o",
+                label=rf"$F$, $z_{{{z_prob:.2f}}}$",
+            )
+
+            ax.plot(
+                out["maturity"],
+                out["Ep"],
+                color=color,
+                linestyle="--",
+                marker="s",
+                label=rf"$E[p]$, $z_{{{z_prob:.2f}}}$",
+            )
+
+        ax.set_title(rf"$q_{{{q_prob:.2f}}}$")
+        ax.set_xlabel("maturity")
+        ax.legend(frameon=False, fontsize=8)
+
+    axes[0].set_ylabel("price")
+    fig.suptitle(
+        rf"Futures vs expected spot, fixed $s={model.s_grid[i_s]:.4f}$"
+    )
+    fig.subplots_adjust(top=0.82)
+
+    return fig, axes, stored
+
+
+# ============================================================
+# RUN DIAGNOSTICS
+# ============================================================
+
+q_probs = (0.05, 0.50, 0.80)
+z_probs = (0.05, 0.50, 0.80)
+s_zoom = 0.10
+
+C = consumption(model)
+B = binding_region(model)
+
+objects = {
+    "s_policy": (model.s_policy, r"Storage policy $s'(s,q,z)$", r"$s'$"),
+    "m_policy": (model.m_policy, r"Use $m(s,q,z)$", r"$m$"),
+    "c_policy": (C, r"Consumption $c(s,q,z)$", r"$c$"),
+    "price": (model.price_s, r"Spot price $p^s(s,q,z)$", r"$p^s$"),
+    "delta": (model.convenience_yield, r"Convenience yield $\delta(s,q,z)$", r"$\delta$"),
+    "binding": (B, r"Binding region $s'(s,q,z)=0$", "binding"),
+}
+
+# ---------- line panels: normal tight layout ----------
+for name, (X, title, ylabel) in objects.items():
+
+    make_and_save(
+        lines_vary_q_across_z,
+        f"{name}_lines_q_across_z.png",
+        model,
+        X,
+        q_probs=q_probs,
+        z_probs=z_probs,
+        title=title + r": varying $q$ across $z$",
+        ylabel=ylabel,
+        s_zoom=s_zoom,
+        tight=True,
+    )
+
+    make_and_save(
+        lines_vary_z_across_q,
+        f"{name}_lines_z_across_q.png",
+        model,
+        X,
+        q_probs=q_probs,
+        z_probs=z_probs,
+        title=title + r": varying $z$ across $q$",
+        ylabel=ylabel,
+        s_zoom=s_zoom,
+        tight=True,
+    )
+
+# ---------- heatmap panels: NO tight layout ----------
+for name, (X, title, label) in objects.items():
+
+    make_and_save(
+        heatmaps_s_q_across_z,
+        f"{name}_heat_s_q_across_z.png",
+        model,
+        X,
+        z_probs=z_probs,
+        title=title + r": $(s,q)$ across $z$",
+        label=label,
+        s_zoom=s_zoom,
+        tight=False,   # important
+    )
+
+    make_and_save(
+        heatmaps_s_z_across_q,
+        f"{name}_heat_s_z_across_q.png",
+        model,
+        X,
+        q_probs=q_probs,
+        title=title + r": $(s,z)$ across $q$",
+        label=label,
+        s_zoom=s_zoom,
+        tight=False,   # important
+    )
+
+# ---------- futures ----------
+make_and_save(
+    futures_curves_vary_q_across_z,
+    "futures_grid_q_across_z.png",
+    model,
+    q_probs=q_probs,
+    z_probs=z_probs,
+    T=12,
+    tight=True,
+)
+
+make_and_save(
+    futures_curves_vary_z_across_q,
+    "futures_grid_z_across_q.png",
+    model,
+    q_probs=q_probs,
+    z_probs=z_probs,
+    T=12,
+    tight=True,
+)
