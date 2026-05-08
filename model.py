@@ -1,4 +1,3 @@
-
 ######################################################
 # A recursive model of commodity prices with storage #
 # Fast Numba version: no 5D arrays, no full futures  #
@@ -14,10 +13,10 @@ import matplotlib.pyplot as plt
 from scipy.stats import norm
 from numba import njit, prange
 
-
 # ============================================================
 # utilities
 # ============================================================
+
 
 # %%
 @contextmanager
@@ -80,6 +79,7 @@ class Tauchen:
 # Numba kernels
 # ============================================================
 
+
 @njit(cache=True)
 def _interp_idx_weight(grid, x):
     n = grid.shape[0]
@@ -119,8 +119,8 @@ def _compute_ee_values(s_grid, q_grid, z_grid, s_policy, alpha, crra):
                     m = 1e-12
 
                 c = z * m**alpha
-                p = alpha * z * m**(alpha - 1.0)
-                EE[i_s, i_q, i_z] = c**(-crra) * p
+                p = alpha * z * m ** (alpha - 1.0)
+                EE[i_s, i_q, i_z] = c ** (-crra) * p
 
     return EE
 
@@ -171,10 +171,9 @@ def _expect_next_policy(X, s_policy, s_grid, P_q, P_z):
             for i_z in range(n_z):
                 s_next = s_policy[i_s, i_q, i_z]
                 idx, w = _interp_idx_weight(s_grid, s_next)
-                out[i_s, i_q, i_z] = (
-                    (1.0 - w) * EX_nodes[idx, i_q, i_z]
-                    + w * EX_nodes[idx + 1, i_q, i_z]
-                )
+                out[i_s, i_q, i_z] = (1.0 - w) * EX_nodes[idx, i_q, i_z] + w * EX_nodes[
+                    idx + 1, i_q, i_z
+                ]
 
     return out
 
@@ -193,8 +192,8 @@ def _egm_step(EE, s_grid, q_grid, z_grid, P_q, P_z, beta, alpha, crra):
             q = q_grid[i_q]
             for i_z in range(n_z):
                 z = z_grid[i_z]
-                denom = alpha * z**(1.0 - crra)
-                m = (RHS[i_s, i_q, i_z] / denom)**(1.0 / theta)
+                denom = alpha * z ** (1.0 - crra)
+                m = (RHS[i_s, i_q, i_z] / denom) ** (1.0 / theta)
                 s_implied[i_s, i_q, i_z] = m + s_prime - q
 
     return s_implied
@@ -287,8 +286,8 @@ def _compute_p_uc_m(s_grid, q_grid, z_grid, s_policy, alpha, crra):
                 c = z * mm**alpha
 
                 m[i_s, i_q, i_z] = mm
-                p[i_s, i_q, i_z] = alpha * z * mm**(alpha - 1.0)
-                uc[i_s, i_q, i_z] = c**(-crra)
+                p[i_s, i_q, i_z] = alpha * z * mm ** (alpha - 1.0)
+                uc[i_s, i_q, i_z] = c ** (-crra)
 
     return m, p, uc
 
@@ -314,8 +313,7 @@ def _convenience_yield_kernel(p, uc, s_policy, s_grid, P_q, P_z, beta):
 
 @njit(cache=True)
 def _futures_curve_at_state(
-    price_s, uc, s_policy, s_grid, P_q, P_z, beta,
-    i_s0, i_q0, i_z0, T
+    price_s, uc, s_policy, s_grid, P_q, P_z, beta, i_s0, i_q0, i_z0, T
 ):
     """
     One futures curve at one initial state.
@@ -492,6 +490,7 @@ def _select_object(F, Ep, W, object_name):
 # model
 # ============================================================
 
+
 class CommodityModel:
     def __init__(
         self,
@@ -499,9 +498,10 @@ class CommodityModel:
         beta,
         alpha,
         n_storage_states=100,
-        storage_max_multiple=4.0,
+        storage_max_multiple=1.5,
         storage_curvature=3.0,
-        inflow_min=0.002,
+        inflow_min=1e-5,
+        inflow_scale=0.020,
         inflow_rho=0.9,
         inflow_sigma=0.1,
         n_inflow_states=20,
@@ -526,7 +526,10 @@ class CommodityModel:
             seed=seed_q,
         )
         self.inflow_min = float(inflow_min)
-        self.q_grid = self.inflow_min + np.ascontiguousarray(np.exp(self.inflow_process.grid))
+        self.inflow_scale = float(inflow_scale)
+        self.q_grid = self.inflow_min + self.inflow_scale * np.ascontiguousarray(
+            np.exp(self.inflow_process.grid)
+        )
         self.P_q = np.ascontiguousarray(self.inflow_process.P)
         self.stationary_dist_q = self.inflow_process.stationary_dist
         self.n_q = int(n_inflow_states)
@@ -539,7 +542,9 @@ class CommodityModel:
             seed=seed_z,
         )
         self.productivity_mean = float(productivity_mean)
-        self.z_grid = np.ascontiguousarray(self.productivity_mean * np.exp(self.productivity_process.grid))
+        self.z_grid = np.ascontiguousarray(
+            self.productivity_mean * np.exp(self.productivity_process.grid)
+        )
         self.P_z = np.ascontiguousarray(self.productivity_process.P)
         self.stationary_dist_z = self.productivity_process.stationary_dist
         self.n_z = int(n_productivity_states)
@@ -549,7 +554,9 @@ class CommodityModel:
         self.storage_curvature = float(storage_curvature)
 
         s_max = self.storage_max_multiple * float(self.q_grid @ self.stationary_dist_q)
-        self.s_grid = np.ascontiguousarray(self.make_storage_grid(s_max, self.n_s, self.storage_curvature))
+        self.s_grid = np.ascontiguousarray(
+            self.make_storage_grid(s_max, self.n_s, self.storage_curvature)
+        )
 
         shape = (self.n_s, self.n_q, self.n_z)
         self.s_policy = np.zeros(shape)
@@ -580,8 +587,7 @@ class CommodityModel:
 
         while error > tol and iteration < max_iter:
             EE = _compute_ee_values(
-                self.s_grid, self.q_grid, self.z_grid,
-                s_policy, self.alpha, self.crra
+                self.s_grid, self.q_grid, self.z_grid, s_policy, self.alpha, self.crra
             )
 
             s_implied = _egm_step(
@@ -668,14 +674,16 @@ class CommodityModel:
         i_z = nearest_index(self.z_grid, z)
 
         out = self.futures_curve_at_index(i_s, i_q, i_z, T=T)
-        out.update({
-            "i_s": i_s,
-            "i_q": i_q,
-            "i_z": i_z,
-            "s": self.s_grid[i_s],
-            "q": self.q_grid[i_q],
-            "z": self.z_grid[i_z],
-        })
+        out.update(
+            {
+                "i_s": i_s,
+                "i_q": i_q,
+                "i_z": i_z,
+                "s": self.s_grid[i_s],
+                "q": self.q_grid[i_q],
+                "z": self.z_grid[i_z],
+            }
+        )
         return out
 
     def futures_surface_fixed_z(self, i_z, T=12, object_name="wedge"):
@@ -720,6 +728,7 @@ class CommodityModel:
         )
         return _select_object(F, Ep, W, object_name)
 
+
 # ============================================================
 # run model
 # ============================================================
@@ -727,18 +736,21 @@ class CommodityModel:
 if __name__ == "__main__":
 
     model = CommodityModel(
-        crra=10.0,
-        beta=0.95,
-        alpha=0.5,
-        n_storage_states=500,
-        inflow_min=0.01,
-        inflow_rho=0.80,
-        inflow_sigma=0.2,
-        n_inflow_states=150,
+        crra=4.0,
+        beta=0.97,
+        alpha=0.50,
+        n_storage_states=100,
+        storage_max_multiple=5.0,
+        storage_curvature=4.0,
+        inflow_min=1e-6,
+        inflow_scale=0.020,
+        inflow_rho=0.90,
+        inflow_sigma=0.45,
+        n_inflow_states=100,
         productivity_mean=1.0,
         productivity_rho=0.90,
-        productivity_sigma=0.10,
-        n_productivity_states=150,
+        productivity_sigma=0.05,
+        n_productivity_states=100,
         seed=123,
     )
 
@@ -755,7 +767,7 @@ if __name__ == "__main__":
     print("Model solved and mapped.")
 
 
-# %% 
+# %%
 # ============================================================
 # plotting + diagnostics: return figures, do not auto-close
 # ============================================================
@@ -788,12 +800,17 @@ def make_and_save(fig_func, filename, *args, tight=True, **kwargs):
     fig = out[0] if isinstance(out, tuple) else out
     save_fig(fig, filename, tight=tight)
 
+
 def visible_ylim(model, X, q_ids=None, z_ids=None, s_zoom=None, pad=0.06):
     """
     Compute y-limits using only the part of the curves visible under s_zoom.
     Works for shared-y panel plots.
     """
-    s_mask = model.s_grid <= s_zoom if s_zoom is not None else np.ones_like(model.s_grid, dtype=bool)
+    s_mask = (
+        model.s_grid <= s_zoom
+        if s_zoom is not None
+        else np.ones_like(model.s_grid, dtype=bool)
+    )
 
     vals = []
 
@@ -811,8 +828,9 @@ def visible_ylim(model, X, q_ids=None, z_ids=None, s_zoom=None, pad=0.06):
 
     return max(0.0, ymin - gap), ymax + gap
 
+
 def consumption(model):
-    return model.z_grid[None, None, :] * model.m_policy ** model.alpha
+    return model.z_grid[None, None, :] * model.m_policy**model.alpha
 
 
 def binding_region(model, tol=1e-8):
@@ -822,6 +840,7 @@ def binding_region(model, tol=1e-8):
 # ============================================================
 # LINE PANELS
 # ============================================================
+
 
 def lines_vary_q_across_z(
     model,
@@ -877,6 +896,8 @@ def lines_vary_q_across_z(
     fig.subplots_adjust(top=0.82)
 
     return fig, axes
+
+
 def lines_vary_z_across_q(
     model,
     X,
@@ -932,9 +953,11 @@ def lines_vary_z_across_q(
 
     return fig, axes
 
+
 # ============================================================
 # heatmaps with constrained_layout=True
 # ============================================================
+
 
 def heatmaps_s_q_across_z(
     model,
@@ -1004,6 +1027,7 @@ def heatmaps_s_q_across_z(
 
     return fig, axes
 
+
 def heatmaps_s_z_across_q(
     model,
     X,
@@ -1072,6 +1096,7 @@ def heatmaps_s_z_across_q(
 
     return fig, axes
 
+
 def futures_curves_vary_q_across_z(
     model,
     q_probs=(0.05, 0.50, 0.80),
@@ -1128,12 +1153,11 @@ def futures_curves_vary_q_across_z(
         ax.legend(frameon=False, fontsize=8)
 
     axes[0].set_ylabel("price")
-    fig.suptitle(
-        rf"Futures vs expected spot, fixed $s={model.s_grid[i_s]:.4f}$"
-    )
+    fig.suptitle(rf"Futures vs expected spot, fixed $s={model.s_grid[i_s]:.4f}$")
     fig.subplots_adjust(top=0.82)
 
     return fig, axes, stored
+
 
 def futures_curves_vary_z_across_q(
     model,
@@ -1191,9 +1215,7 @@ def futures_curves_vary_z_across_q(
         ax.legend(frameon=False, fontsize=8)
 
     axes[0].set_ylabel("price")
-    fig.suptitle(
-        rf"Futures vs expected spot, fixed $s={model.s_grid[i_s]:.4f}$"
-    )
+    fig.suptitle(rf"Futures vs expected spot, fixed $s={model.s_grid[i_s]:.4f}$")
     fig.subplots_adjust(top=0.82)
 
     return fig, axes, stored
@@ -1205,7 +1227,6 @@ def futures_curves_vary_z_across_q(
 
 q_probs = (0.05, 0.50, 0.80)
 z_probs = (0.05, 0.50, 0.80)
-s_zoom = 0.10
 
 C = consumption(model)
 B = binding_region(model)
@@ -1215,7 +1236,11 @@ objects = {
     "m_policy": (model.m_policy, r"Use $m(s,q,z)$", r"$m$"),
     "c_policy": (C, r"Consumption $c(s,q,z)$", r"$c$"),
     "price": (model.price_s, r"Spot price $p^s(s,q,z)$", r"$p^s$"),
-    "delta": (model.convenience_yield, r"Convenience yield $\delta(s,q,z)$", r"$\delta$"),
+    "delta": (
+        model.convenience_yield,
+        r"Convenience yield $\delta(s,q,z)$",
+        r"$\delta$",
+    ),
     "binding": (B, r"Binding region $s'(s,q,z)=0$", "binding"),
 }
 
@@ -1231,7 +1256,6 @@ for name, (X, title, ylabel) in objects.items():
         z_probs=z_probs,
         title=title + r": varying $q$ across $z$",
         ylabel=ylabel,
-        s_zoom=s_zoom,
         tight=True,
     )
 
@@ -1244,7 +1268,6 @@ for name, (X, title, ylabel) in objects.items():
         z_probs=z_probs,
         title=title + r": varying $z$ across $q$",
         ylabel=ylabel,
-        s_zoom=s_zoom,
         tight=True,
     )
 
@@ -1259,8 +1282,7 @@ for name, (X, title, label) in objects.items():
         z_probs=z_probs,
         title=title + r": $(s,q)$ across $z$",
         label=label,
-        s_zoom=s_zoom,
-        tight=False,   # important
+        tight=False,  # important
     )
 
     make_and_save(
@@ -1271,8 +1293,7 @@ for name, (X, title, label) in objects.items():
         q_probs=q_probs,
         title=title + r": $(s,z)$ across $q$",
         label=label,
-        s_zoom=s_zoom,
-        tight=False,   # important
+        tight=False,  # important
     )
 
 # ---------- futures ----------
