@@ -1,0 +1,37 @@
+name: baseline
+
+model:
+  crra: 5.0
+  beta: 0.93
+  alpha: 0.50
+
+  n_storage_states: 100
+  storage_max_multiple: 3.0
+  storage_curvature: 3.0
+
+  inflow_min: 1.0e-6
+  inflow_scale: 0.04
+  inflow_rho: 0.90
+  inflow_sigma: 0.42
+  n_inflow_states: 100
+
+  productivity_mean: 1.0
+  productivity_rho: 0.95
+  productivity_sigma: 0.08
+  n_productivity_states: 100
+
+  seed: 123
+
+solve:
+  tol: 1.0e-6
+  max_iter: 500
+  verbose: true
+
+figures:
+  q_probs: [0.025, 0.50, 0.975]
+  z_probs: [0.10, 0.50, 0.90]
+  s_probs: [0.025, 0.50, 0.975]
+
+  horizons: [1, 2, 3, 6, 12]
+
+  s_zoom_multiple: 1.5
