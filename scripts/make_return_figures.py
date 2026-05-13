@@ -7,7 +7,9 @@ from commodity.io import load_model
 from commodity.plots.base import make_and_save
 from commodity.plots.returns import (
     heatmaps_expected_holding_return_s_q_across_z,
+    heatmaps_expected_holding_return_s_z_across_q,
     lines_expected_holding_return_vary_s_across_z,
+    lines_expected_holding_return_vary_s_across_q,
 )
 
 
@@ -21,6 +23,7 @@ def make_return_figures(config_path):
 
     q_probs = tuple(fig_cfg.q_probs)
     z_probs = tuple(fig_cfg.z_probs)
+    horizons = tuple(n for n in fig_cfg.horizons if n >= 2)
 
     s_zoom = storage_zoom(
         model,
@@ -30,14 +33,16 @@ def make_return_figures(config_path):
     outdir = Path("outputs/figures") / cfg.name / "returns"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    for n in (2, 3, 6, 12):
+    for n in horizons:
+        print(f"Making expected holding return figures for n={n}...")
+
         make_and_save(
             heatmaps_expected_holding_return_s_q_across_z,
             f"holding_return_heat_s_q_across_z_n{n}.png",
             model,
             z_probs=z_probs,
             n=n,
-            return_type="level",
+            return_type="percent",
             s_zoom=s_zoom,
             folder=outdir,
             tight=False,
@@ -50,10 +55,35 @@ def make_return_figures(config_path):
             z_probs=z_probs,
             q_probs=q_probs,
             n=n,
-            return_type="level",
+            return_type="percent",
             s_zoom=s_zoom,
             folder=outdir,
-            tight=True,
+            tight=False,
+        )
+
+        make_and_save(
+            heatmaps_expected_holding_return_s_z_across_q,
+            f"holding_return_heat_s_z_across_q_n{n}.png",
+            model,
+            q_probs=q_probs,
+            n=n,
+            return_type="percent",
+            s_zoom=s_zoom,
+            folder=outdir,
+            tight=False,
+        )
+
+        make_and_save(
+            lines_expected_holding_return_vary_s_across_q,
+            f"holding_return_lines_s_across_q_n{n}.png",
+            model,
+            q_probs=q_probs,
+            z_probs=z_probs,
+            n=n,
+            return_type="percent",
+            s_zoom=s_zoom,
+            folder=outdir,
+            tight=False,
         )
 
     print(f"Saved expected holding return figures to {outdir}")
@@ -69,7 +99,6 @@ def main():
     )
 
     args = parser.parse_args()
-
     make_return_figures(args.config)
 
 

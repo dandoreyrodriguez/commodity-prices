@@ -10,12 +10,12 @@ from commodity.plots.futures import (
     expected_spot_heatmaps_s_z_across_q,
     futures_curves_vary_q_across_z,
     futures_curves_vary_z_across_q,
+    pure_expected_spot_term_structure_grid,
+    pure_futures_term_structure_grid,
     wedge_heatmaps_s_q_across_z,
     wedge_heatmaps_s_z_across_q,
     wedge_lines_vary_q_across_z,
     wedge_term_structure_grid,
-    pure_futures_term_structure_grid,
-    pure_expected_spot_term_structure_grid,
 )
 
 
@@ -38,37 +38,42 @@ def make_futures_figures(config_path):
     )
 
     outdir = Path("outputs/figures") / cfg.name / "futures"
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    print("SCRIPT:", Path(__file__).resolve())
-    print("MODEL:", model_path.resolve())
-    print("OUTDIR:", outdir.resolve())
-    print("HORIZONS:", horizons)
+    Tmax = max(horizons)
 
-    make_and_save(
-        futures_curves_vary_q_across_z,
-        "futures_grid_q_across_z.png",
-        model,
-        q_probs=q_probs,
-        z_probs=z_probs,
-        s_prob=0.75,
-        T=max(horizons),
-        folder=outdir,
-        tight=True,
-    )
+    for s_prob in s_probs:
+        
+        s_tag = f"s{int(round(100 * s_prob)):02d}"
 
-    make_and_save(
-        futures_curves_vary_z_across_q,
-        "futures_grid_z_across_q.png",
-        model,
-        q_probs=q_probs,
-        z_probs=z_probs,
-        s_prob=0.75,
-        T=max(horizons),
-        folder=outdir,
-        tight=True,
-    )
+        make_and_save(
+            futures_curves_vary_q_across_z,
+            f"futures_grid_q_across_z_{s_tag}.png",
+            model,
+            q_probs=q_probs,
+            z_probs=z_probs,
+            s_prob=s_prob,
+            T=Tmax,
+            folder=outdir,
+            tight=True,
+        )
+
+        make_and_save(
+            futures_curves_vary_z_across_q,
+            f"futures_grid_z_across_q_{s_tag}.png",
+            model,
+            q_probs=q_probs,
+            z_probs=z_probs,
+            s_prob=s_prob,
+            T=Tmax,
+            folder=outdir,
+            tight=True,
+        )
 
     for h in horizons:
+
+        print(f"Making futures diagnostics for T={h}...")
+
         make_and_save(
             wedge_heatmaps_s_q_across_z,
             f"wedge_heat_s_q_across_z_T{h}.png",
@@ -129,6 +134,8 @@ def make_futures_figures(config_path):
             tight=False,
         )
 
+    print("Making term structure figures...")
+
     make_and_save(
         wedge_term_structure_grid,
         "wedge_term_structure_grid.png",
@@ -136,12 +143,10 @@ def make_futures_figures(config_path):
         s_probs=s_probs,
         q_probs=q_probs,
         z_probs=z_probs,
-        T=max(horizons),
+        T=Tmax,
         folder=outdir,
         tight=True,
     )
-
-    print("Making pure futures...")
 
     make_and_save(
         pure_futures_term_structure_grid,
@@ -150,7 +155,7 @@ def make_futures_figures(config_path):
         s_probs=s_probs,
         q_probs=q_probs,
         z_probs=z_probs,
-        T=max(horizons),
+        T=Tmax,
         folder=outdir,
         tight=True,
     )
@@ -162,14 +167,12 @@ def make_futures_figures(config_path):
         s_probs=s_probs,
         q_probs=q_probs,
         z_probs=z_probs,
-        T=max(horizons),
+        T=Tmax,
         folder=outdir,
         tight=True,
     )
 
     print(f"Saved futures figures to {outdir}")
-
-
 
 
 def main():
@@ -182,7 +185,6 @@ def main():
     )
 
     args = parser.parse_args()
-
     make_futures_figures(args.config)
 
 

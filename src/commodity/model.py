@@ -8,9 +8,14 @@ from commodity.kernels import (
     _compute_p_uc_m,
     _convenience_yield_kernel,
     _futures_curve_at_state,
+    _futures_grids_at_horizon,
     _futures_surface_fixed_z_at_horizon,
     _futures_surface_fixed_q_at_horizon,
     _futures_surface_fixed_s_at_horizon,
+    _expected_holding_grid,
+    _expected_holding_fixed_z,
+    _expected_holding_fixed_q,
+    _expected_holding_fixed_s,
 )
 from commodity.utils import nearest_index
 
@@ -23,7 +28,16 @@ def _select_object(F, Ep, W, object_name):
     if object_name == "wedge":
         return W
 
-    raise ValueError("object_name must be 'F', 'Ep', or 'wedge'")
+    raise ValueError("object_name must be 'F', 'Ep', or 'wedge'.")
+
+
+def _select_return(payoff, ret, return_type):
+    if return_type == "level":
+        return payoff
+    if return_type == "percent":
+        return ret
+
+    raise ValueError("return_type must be either 'level' or 'percent'.")
 
 
 class CommodityModel:
@@ -63,11 +77,9 @@ class CommodityModel:
 
         self.inflow_min = float(inflow_min)
         self.inflow_scale = float(inflow_scale)
-
         self.q_grid = self.inflow_min + self.inflow_scale * np.ascontiguousarray(
             np.exp(self.inflow_process.grid)
         )
-
         self.P_q = np.ascontiguousarray(self.inflow_process.P)
         self.stationary_dist_q = self.inflow_process.stationary_dist
         self.n_q = int(n_inflow_states)
@@ -81,11 +93,9 @@ class CommodityModel:
         )
 
         self.productivity_mean = float(productivity_mean)
-
         self.z_grid = np.ascontiguousarray(
             self.productivity_mean * np.exp(self.productivity_process.grid)
         )
-
         self.P_z = np.ascontiguousarray(self.productivity_process.P)
         self.stationary_dist_z = self.productivity_process.stationary_dist
         self.n_z = int(n_productivity_states)
@@ -94,10 +104,7 @@ class CommodityModel:
         self.storage_max_multiple = float(storage_max_multiple)
         self.storage_curvature = float(storage_curvature)
 
-        s_max = self.storage_max_multiple * float(
-            self.q_grid @ self.stationary_dist_q
-        )
-
+        s_max = self.storage_max_multiple * float(self.q_grid @ self.stationary_dist_q)
         self.s_grid = np.ascontiguousarray(
             self.make_storage_grid(
                 s_max=s_max,
@@ -120,12 +127,7 @@ class CommodityModel:
         x = np.linspace(0.0, 1.0, n_s)
         return s_max * x**curvature
 
-    def solve_egm(
-        self,
-        tol=1e-6,
-        max_iter=500,
-        verbose=True,
-    ):
+    def solve_egm(self, tol=1e-6, max_iter=500, verbose=True):
         s = self.s_grid[:, None, None]
         q = self.q_grid[None, :, None]
 
@@ -146,7 +148,6 @@ class CommodityModel:
         iteration = 0
 
         while error > tol and iteration < max_iter:
-
             EE = _compute_ee_values(
                 self.s_grid,
                 self.q_grid,
@@ -175,7 +176,6 @@ class CommodityModel:
             )
 
             error = float(np.max(np.abs(s_policy_new - s_policy)))
-
             s_policy = np.ascontiguousarray(s_policy_new)
             iteration += 1
 
@@ -220,13 +220,19 @@ class CommodityModel:
 
         return self
 
-    def futures_curve_at_index(
-        self,
-        i_s,
-        i_q,
-        i_z,
-        T=12,
-    ):
+    def _require_priced(self):
+        if not np.any(self.price_s) or not np.any(self.u_c):
+            raise RuntimeError(
+                "Run map_to_decentralised() before computing futures or returns."
+            )
+
+    # ========================================================
+    # futures
+    # ========================================================
+
+    def futures_curve_at_index(self, i_s, i_q, i_z, T=12):
+        self._require_priced()
+
         F, Ep, wedge = _futures_curve_at_state(
             self.price_s,
             self.u_c,
@@ -248,13 +254,7 @@ class CommodityModel:
             "wedge": wedge,
         }
 
-    def futures_curve_at_values(
-        self,
-        s,
-        q,
-        z,
-        T=12,
-    ):
+    def futures_curve_at_values(self, s, q, z, T=12):
         i_s = nearest_index(self.s_grid, s)
         i_q = nearest_index(self.q_grid, q)
         i_z = nearest_index(self.z_grid, z)
@@ -279,12 +279,27 @@ class CommodityModel:
 
         return out
 
-    def futures_surface_fixed_z(
-        self,
-        i_z,
-        T=12,
-        object_name="wedge",
-    ):
+    def futures_grids(self, T=12):
+        self._require_priced()
+
+        return _futures_grids_at_horizon(
+            self.price_s,
+            self.u_c,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            self.beta,
+            int(T),
+        )
+
+    def futures_grid(self, T=12, object_name="F"):
+        F, Ep, W = self.futures_grids(T=T)
+        return _select_object(F, Ep, W, object_name)
+
+    def futures_surface_fixed_z(self, i_z, T=12, object_name="wedge"):
+        self._require_priced()
+
         F, Ep, W = _futures_surface_fixed_z_at_horizon(
             self.price_s,
             self.u_c,
@@ -299,12 +314,9 @@ class CommodityModel:
 
         return _select_object(F, Ep, W, object_name)
 
-    def futures_surface_fixed_q(
-        self,
-        i_q,
-        T=12,
-        object_name="wedge",
-    ):
+    def futures_surface_fixed_q(self, i_q, T=12, object_name="wedge"):
+        self._require_priced()
+
         F, Ep, W = _futures_surface_fixed_q_at_horizon(
             self.price_s,
             self.u_c,
@@ -319,12 +331,9 @@ class CommodityModel:
 
         return _select_object(F, Ep, W, object_name)
 
-    def futures_surface_fixed_s(
-        self,
-        i_s,
-        T=12,
-        object_name="wedge",
-    ):
+    def futures_surface_fixed_s(self, i_s, T=12, object_name="wedge"):
+        self._require_priced()
+
         F, Ep, W = _futures_surface_fixed_s_at_horizon(
             self.price_s,
             self.u_c,
@@ -338,3 +347,168 @@ class CommodityModel:
         )
 
         return _select_object(F, Ep, W, object_name)
+    # ========================================================
+    # expected one-period holding payoff / return
+    # ========================================================
+
+    def expected_holding_return_grid(self, n=3, return_type="level"):
+        """
+        Full-grid expected one-period holding payoff/return:
+
+            E_t[F_{t+1}^{(n-1)}] - F_t^{(n)}
+
+        If return_type='percent', divides the payoff by F_t^{(n)}.
+        """
+
+        if n < 2:
+            raise ValueError("Need n >= 2 because tomorrow maturity is n-1.")
+
+        self._require_priced()
+
+        F_now_grid = self.futures_grid(T=n, object_name="F")
+        F_next_grid = self.futures_grid(T=n - 1, object_name="F")
+
+        EF_next, payoff, ret = _expected_holding_grid(
+            F_now_grid,
+            F_next_grid,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+        )
+
+        obj = _select_return(payoff, ret, return_type)
+
+        return {
+            "object": obj,
+            "payoff": payoff,
+            "return": ret,
+            "F_now": F_now_grid,
+            "EF_next": EF_next,
+        }
+
+    def expected_holding_return_fixed_z(self, i_z, n=3, return_type="level"):
+        """
+        Expected one-period holding payoff/return over (s,q),
+        holding current z fixed.
+        """
+
+        if n < 2:
+            raise ValueError("Need n >= 2 because tomorrow maturity is n-1.")
+
+        self._require_priced()
+
+        F_now = self.futures_surface_fixed_z(
+            i_z=i_z,
+            T=n,
+            object_name="F",
+        )
+
+        F_next_grid = self.futures_grid(
+            T=n-1,
+            object_name="F",
+        )
+
+        EF_next, payoff, ret = _expected_holding_fixed_z(
+            F_now,
+            F_next_grid,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            int(i_z),
+        )
+
+        obj = _select_return(payoff, ret, return_type)
+
+        return {
+            "object": obj,
+            "payoff": payoff,
+            "return": ret,
+            "F_now": F_now,
+            "EF_next": EF_next,
+        }
+
+    def expected_holding_return_fixed_q(self, i_q, n=3, return_type="level"):
+        """
+        Expected one-period holding payoff/return over (s,z),
+        holding current q fixed.
+        """
+
+        if n < 2:
+            raise ValueError("Need n >= 2 because tomorrow maturity is n-1.")
+
+        self._require_priced()
+
+        F_now = self.futures_surface_fixed_q(
+            i_q=i_q,
+            T=n,
+            object_name="F",
+        )
+
+        F_next_grid = self.futures_grid(
+            T=n - 1,
+            object_name="F",
+        )
+
+        EF_next, payoff, ret = _expected_holding_fixed_q(
+            F_now,
+            F_next_grid,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            int(i_q),
+        )
+
+        obj = _select_return(payoff, ret, return_type)
+
+        return {
+            "object": obj,
+            "payoff": payoff,
+            "return": ret,
+            "F_now": F_now,
+            "EF_next": EF_next,
+        }
+
+    def expected_holding_return_fixed_s(self, i_s, n=3, return_type="level"):
+        """
+        Expected one-period holding payoff/return over (q,z),
+        holding current s fixed.
+        """
+
+        if n < 2:
+            raise ValueError("Need n >= 2 because tomorrow maturity is n-1.")
+
+        self._require_priced()
+
+        F_now = self.futures_surface_fixed_s(
+            i_s=i_s,
+            T=n,
+            object_name="F",
+        )
+
+        F_next_grid = self.futures_grid(
+            T=n-1,
+            object_name="F",
+        )
+
+        EF_next, payoff, ret = _expected_holding_fixed_s(
+            F_now,
+            F_next_grid,
+            self.s_policy,
+            self.s_grid,
+            self.P_q,
+            self.P_z,
+            int(i_s),
+        )
+
+        obj = _select_return(payoff, ret, return_type)
+
+        return {
+            "object": obj,
+            "payoff": payoff,
+            "return": ret,
+            "F_now": F_now,
+            "EF_next": EF_next,
+        }

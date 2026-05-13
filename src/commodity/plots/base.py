@@ -6,9 +6,9 @@ import numpy as np
 from commodity.utils import ensure_dir
 
 
-def save_fig(fig, filename, folder="outputs/figures", tight=True):
+def save_fig(fig, filename, folder="figures", tight=True):
     folder = Path(folder)
-    ensure_dir(folder)
+    folder.mkdir(parents=True, exist_ok=True)
 
     if tight:
         fig.tight_layout()
@@ -17,24 +17,10 @@ def save_fig(fig, filename, folder="outputs/figures", tight=True):
     plt.close(fig)
 
 
-def make_and_save(
-    fig_func,
-    filename,
-    *args,
-    folder="outputs/figures",
-    tight=True,
-    **kwargs,
-):
+def make_and_save(fig_func, filename, *args, folder="figures", tight=True, **kwargs):
     out = fig_func(*args, **kwargs)
     fig = out[0] if isinstance(out, tuple) else out
-
-    save_fig(
-        fig,
-        filename,
-        folder=folder,
-        tight=tight,
-    )
-
+    save_fig(fig, filename, folder=folder, tight=tight)
 
 def heatmap_limits(
     X,

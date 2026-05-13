@@ -1,4 +1,5 @@
 pyproject.toml
+src/commodity/__init__.py
 src/commodity/config.py
 src/commodity/diagnostics.py
 src/commodity/discretization.py
